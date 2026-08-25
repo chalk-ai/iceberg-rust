@@ -19,7 +19,7 @@ fi
 bash .buildkite/ci.sh fmt
 bash .buildkite/ci.sh clippy
 bash .buildkite/ci.sh chalk-consumer
-cargo test --no-fail-fast --all-targets --all-features --workspace
+bash .buildkite/ci.sh test
 
 buildkite-agent annotate --style "success" --context "release" \
   "Validated Iceberg Rust fork release ${tag} at ${BUILDKITE_COMMIT}."

@@ -25,6 +25,11 @@ steps:
       - label: ":iceberg: chalk consumer crates"
         command: "bash .buildkite/ci.sh chalk-consumer"
 
+      - label: ":docker: integration tests"
+        command: "bash .buildkite/ci.sh docker-integration-test"
+        soft_fail:
+          - exit_status: "*"
+
   - group: "Repository hygiene"
     steps:
       - label: ":mag: cargo machete"
@@ -32,6 +37,8 @@ steps:
 
       - label: ":shield: cargo audit"
         command: "bash .buildkite/ci.sh audit"
+        soft_fail:
+          - exit_status: "*"
 
       - label: ":memo: typos"
         command: "bash .buildkite/ci.sh typos"
