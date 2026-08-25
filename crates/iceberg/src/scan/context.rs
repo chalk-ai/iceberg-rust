@@ -61,6 +61,11 @@ pub(crate) struct ManifestEntryContext {
     pub case_sensitive: bool,
 }
 
+type ManifestFileContextResults = (
+    Vec<Result<ManifestFileContext>>,
+    Vec<Result<ManifestFileContext>>,
+);
+
 impl ManifestFileContext {
     /// Consumes this [`ManifestFileContext`], fetching its Manifest from FileIO and then
     /// streaming its constituent [`ManifestEntries`] to the channel provided in the context
@@ -101,9 +106,8 @@ impl ManifestFileContext {
 }
 
 impl ManifestEntryContext {
-    /// consume this `ManifestEntryContext`, returning a `FileScanTask`
-    /// created from it
-    pub(crate) fn into_file_scan_task(
+    /// Creates a `FileScanTask` from this manifest entry context.
+    pub(crate) fn to_file_scan_task(
         &self,
         delete_file_index: &DeleteFileIndex,
     ) -> Result<FileScanTask> {
@@ -195,10 +199,7 @@ impl PlanContext {
         manifest_list: Arc<ManifestList>,
         tx_data: Sender<ManifestEntryContext>,
         delete_file_tx: Sender<ManifestEntryContext>,
-    ) -> Result<(
-        Vec<Result<ManifestFileContext>>,
-        Vec<Result<ManifestFileContext>>,
-    )> {
+    ) -> Result<ManifestFileContextResults> {
         let mut manifest_files = manifest_list.entries().iter().collect::<Vec<_>>();
         // Sort manifest files to process delete manifests first.
         // This avoids a deadlock where the producer blocks on sending data manifest entries

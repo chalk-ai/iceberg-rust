@@ -210,12 +210,12 @@ impl Transaction {
 
         let result = (|mut tx: Transaction| async {
             let result = tx.do_commit(catalog).await;
-            if let Err(ref e) = result {
-                if e.retryable() {
-                    retry_count.fetch_add(1, Ordering::SeqCst);
-                    if let Ok(mut kinds) = error_kinds.lock() {
-                        kinds.push(format!("{:?}", e.kind()));
-                    }
+            if let Err(ref e) = result
+                && e.retryable()
+            {
+                retry_count.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut kinds) = error_kinds.lock() {
+                    kinds.push(format!("{:?}", e.kind()));
                 }
             }
             (tx, result)

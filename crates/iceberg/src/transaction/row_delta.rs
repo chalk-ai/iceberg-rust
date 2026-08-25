@@ -103,17 +103,17 @@ impl RowDeltaAction {
 #[async_trait]
 impl TransactionAction for RowDeltaAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        if let Some(expected_snapshot_id) = self.starting_snapshot_id {
-            if table.metadata().current_snapshot_id() != Some(expected_snapshot_id) {
-                return Err(crate::Error::new(
-                    crate::ErrorKind::DataInvalid,
-                    format!(
-                        "Cannot commit RowDelta based on stale snapshot. Expected: {}, Current: {:?}",
-                        expected_snapshot_id,
-                        table.metadata().current_snapshot_id()
-                    ),
-                ));
-            }
+        if let Some(expected_snapshot_id) = self.starting_snapshot_id
+            && table.metadata().current_snapshot_id() != Some(expected_snapshot_id)
+        {
+            return Err(crate::Error::new(
+                crate::ErrorKind::DataInvalid,
+                format!(
+                    "Cannot commit RowDelta based on stale snapshot. Expected: {}, Current: {:?}",
+                    expected_snapshot_id,
+                    table.metadata().current_snapshot_id()
+                ),
+            ));
         }
 
         let snapshot_producer = SnapshotProducer::new(

@@ -497,7 +497,7 @@ impl TableScan {
         // FileScanTask and push it to the result stream
         file_scan_task_tx
             .send(Ok(
-                manifest_entry_context.into_file_scan_task(&delete_file_index)?
+                manifest_entry_context.to_file_scan_task(&delete_file_index)?
             ))
             .await?;
 
@@ -600,10 +600,10 @@ pub fn filter_tasks_by_predicate(
             continue;
         };
 
-        if let Some(eval) = partition_evaluators.get(&data_file.partition_spec_id()) {
-            if !eval.eval(data_file).unwrap_or(true) {
-                continue;
-            }
+        if let Some(eval) = partition_evaluators.get(&data_file.partition_spec_id())
+            && !eval.eval(data_file).unwrap_or(true)
+        {
+            continue;
         }
 
         if !InclusiveMetricsEvaluator::eval(&bound, data_file, false).unwrap_or(true) {
