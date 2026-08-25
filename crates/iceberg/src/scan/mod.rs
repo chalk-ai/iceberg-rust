@@ -352,70 +352,60 @@ impl TableScan {
         // used to stream the results back to the caller
         let (file_scan_task_tx, file_scan_task_rx) = channel(concurrency_limit_manifest_entries);
 
-        let (delete_file_idx, delete_file_tx) = DeleteFileIndex::new();
-
         let manifest_list = plan_context.get_manifest_list().await?;
 
         // get the [`ManifestFile`]s from the [`ManifestList`], filtering out any
         // whose partitions cannot match this
         // scan's filter
-        let manifest_file_contexts = plan_context.build_manifest_file_contexts(
-            manifest_list,
-            manifest_entry_data_ctx_tx,
-            delete_file_idx.clone(),
-            manifest_entry_delete_ctx_tx,
-        )?;
+        let (delete_manifest_contexts, data_manifest_contexts) = plan_context
+            .build_manifest_file_contexts(
+                manifest_list,
+                manifest_entry_data_ctx_tx,
+                manifest_entry_delete_ctx_tx,
+            )?;
 
-        let mut channel_for_manifest_error = file_scan_task_tx.clone();
+        let fetch_delete_manifests = futures::stream::iter(delete_manifest_contexts)
+            .try_for_each_concurrent(concurrency_limit_manifest_files, |ctx| async move {
+                ctx.fetch_manifest_and_stream_manifest_entries().await
+            });
+        let collect_delete_files = manifest_entry_delete_ctx_rx
+            .map(|me_ctx| spawn(async move { Self::process_delete_manifest_entry(me_ctx).await }))
+            .buffered(concurrency_limit_manifest_entries)
+            .try_filter_map(|delete_file| std::future::ready(Ok(delete_file)))
+            .try_collect::<Vec<_>>();
+        let ((), delete_files) = futures::try_join!(fetch_delete_manifests, collect_delete_files)?;
+        let delete_file_index = DeleteFileIndex::new(delete_files);
 
-        // Concurrently load all [`Manifest`]s and stream their [`ManifestEntry`]s
+        let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
+        let mut channel_for_data_manifest_error = file_scan_task_tx.clone();
+
+        // Concurrently load data [`Manifest`]s and stream their [`ManifestEntry`]s.
         spawn(async move {
-            let result = futures::stream::iter(manifest_file_contexts)
+            let result = futures::stream::iter(data_manifest_contexts)
                 .try_for_each_concurrent(concurrency_limit_manifest_files, |ctx| async move {
                     ctx.fetch_manifest_and_stream_manifest_entries().await
                 })
                 .await;
 
             if let Err(error) = result {
-                let _ = channel_for_manifest_error.send(Err(error)).await;
+                let _ = channel_for_data_manifest_error.send(Err(error)).await;
             }
         });
-
-        let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
-        let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
-
-        // Process the delete file [`ManifestEntry`] stream in parallel
-        spawn(async move {
-            let result = manifest_entry_delete_ctx_rx
-                .map(|me_ctx| Ok((me_ctx, delete_file_tx.clone())))
-                .try_for_each_concurrent(
-                    concurrency_limit_manifest_entries,
-                    |(manifest_entry_context, tx)| async move {
-                        spawn(async move {
-                            Self::process_delete_manifest_entry(manifest_entry_context, tx).await
-                        })
-                        .await
-                    },
-                )
-                .await;
-
-            if let Err(error) = result {
-                let _ = channel_for_delete_manifest_entry_error
-                    .send(Err(error))
-                    .await;
-            }
-        })
-        .await;
 
         // Process the data file [`ManifestEntry`] stream in parallel
         spawn(async move {
             let result = manifest_entry_data_ctx_rx
-                .map(|me_ctx| Ok((me_ctx, file_scan_task_tx.clone())))
+                .map(|me_ctx| Ok((me_ctx, delete_file_index.clone(), file_scan_task_tx.clone())))
                 .try_for_each_concurrent(
                     concurrency_limit_manifest_entries,
-                    |(manifest_entry_context, tx)| async move {
+                    |(manifest_entry_context, delete_file_index, tx)| async move {
                         spawn(async move {
-                            Self::process_data_manifest_entry(manifest_entry_context, tx).await
+                            Self::process_data_manifest_entry(
+                                manifest_entry_context,
+                                delete_file_index,
+                                tx,
+                            )
+                            .await
                         })
                         .await
                     },
@@ -456,6 +446,7 @@ impl TableScan {
 
     async fn process_data_manifest_entry(
         manifest_entry_context: ManifestEntryContext,
+        delete_file_index: DeleteFileIndex,
         mut file_scan_task_tx: Sender<Result<FileScanTask>>,
     ) -> Result<()> {
         // skip processing this manifest entry if it has been marked as deleted
@@ -505,7 +496,9 @@ impl TableScan {
         // entire plan without getting filtered out. Create a corresponding
         // FileScanTask and push it to the result stream
         file_scan_task_tx
-            .send(Ok(manifest_entry_context.into_file_scan_task().await?))
+            .send(Ok(
+                manifest_entry_context.into_file_scan_task(&delete_file_index)?
+            ))
             .await?;
 
         Ok(())
@@ -513,11 +506,10 @@ impl TableScan {
 
     async fn process_delete_manifest_entry(
         manifest_entry_context: ManifestEntryContext,
-        mut delete_file_ctx_tx: Sender<DeleteFileContext>,
-    ) -> Result<()> {
+    ) -> Result<Option<DeleteFileContext>> {
         // skip processing this manifest entry if it has been marked as deleted
         if !manifest_entry_context.manifest_entry.is_alive() {
-            return Ok(());
+            return Ok(None);
         }
 
         // abort the plan if we encounter a manifest entry that is not for a delete file
@@ -540,24 +532,88 @@ impl TableScan {
             // skip any data file whose partition data indicates that it can't contain
             // any data that matches this scan's filter
             if !expression_evaluator.eval(manifest_entry_context.manifest_entry.data_file())? {
-                return Ok(());
+                return Ok(None);
             }
         }
 
-        delete_file_ctx_tx
-            .send(DeleteFileContext {
-                manifest_entry: manifest_entry_context.manifest_entry.clone(),
-                partition_spec_id: manifest_entry_context.partition_spec_id,
-            })
-            .await?;
-
-        Ok(())
+        Ok(Some(DeleteFileContext {
+            manifest_entry: manifest_entry_context.manifest_entry.clone(),
+            partition_spec_id: manifest_entry_context.partition_spec_id,
+        }))
     }
 }
 
 pub(crate) struct BoundPredicates {
     partition_bound_predicate: BoundPredicate,
     snapshot_bound_predicate: BoundPredicate,
+}
+
+/// Filter a pre-fetched list of [`FileScanTask`]s using a predicate, without re-reading manifests.
+pub fn filter_tasks_by_predicate(
+    table: &Table,
+    tasks: &[FileScanTask],
+    predicate: &Predicate,
+) -> Result<Vec<FileScanTask>> {
+    use std::collections::{HashMap, HashSet};
+
+    use crate::expr::visitors::expression_evaluator::ExpressionEvaluator;
+
+    if *predicate == Predicate::AlwaysTrue {
+        return Ok(tasks.to_vec());
+    }
+
+    let schema = table.metadata().current_schema();
+    let bound = predicate
+        .clone()
+        .rewrite_not()
+        .bind(schema.clone(), true)
+        .map_err(|e| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("failed to bind predicate for cache pruning: {e}"),
+            )
+        })?;
+
+    let table_metadata = table.metadata_ref();
+    let partition_filter_cache = PartitionFilterCache::new();
+    let partition_evaluators: HashMap<i32, ExpressionEvaluator> = tasks
+        .iter()
+        .filter_map(|task| task.data_file.as_ref().map(|f| f.partition_spec_id()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter_map(|spec_id| {
+            let partition_filter = partition_filter_cache
+                .get(spec_id, &table_metadata, schema, true, bound.clone())
+                .ok()?;
+
+            Some((
+                spec_id,
+                ExpressionEvaluator::new(partition_filter.as_ref().clone()),
+            ))
+        })
+        .collect();
+
+    let mut kept = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let Some(data_file) = task.data_file.as_ref() else {
+            kept.push(task.clone());
+            continue;
+        };
+
+        if let Some(eval) = partition_evaluators.get(&data_file.partition_spec_id()) {
+            if !eval.eval(data_file).unwrap_or(true) {
+                continue;
+            }
+        }
+
+        if !InclusiveMetricsEvaluator::eval(&bound, data_file, false).unwrap_or(true) {
+            continue;
+        }
+
+        kept.push(task.clone());
+    }
+
+    Ok(kept)
 }
 
 #[cfg(test)]
@@ -1886,6 +1942,8 @@ pub mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            data_file: None,
+            data_sequence_number: None,
         };
         test_fn(task);
 
@@ -1904,6 +1962,8 @@ pub mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            data_file: None,
+            data_sequence_number: None,
         };
         test_fn(task);
     }
