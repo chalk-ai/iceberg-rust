@@ -49,7 +49,8 @@ use crate::{Error, ErrorKind, ensure_data_valid};
 pub type SchemaId = i32;
 /// Reference to [`Schema`].
 pub type SchemaRef = Arc<Schema>;
-pub(crate) const DEFAULT_SCHEMA_ID: SchemaId = 0;
+/// Default schema id.
+pub const DEFAULT_SCHEMA_ID: SchemaId = 0;
 
 /// Defines schema in iceberg.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -101,8 +102,8 @@ impl SchemaBuilder {
     /// Reassignment starts from the field-id specified in `start_from` (inclusive).
     ///
     /// All specified aliases and identifier fields will be updated to the new field-ids.
-    pub(crate) fn with_reassigned_field_ids(mut self, start_from: u32) -> Self {
-        self.reassign_field_ids_from = Some(start_from.try_into().unwrap_or(i32::MAX));
+    pub(crate) fn with_reassigned_field_ids(mut self, start_from: i32) -> Self {
+        self.reassign_field_ids_from = Some(start_from);
         self
     }
 
@@ -410,8 +411,13 @@ impl Schema {
     }
 
     /// Return A HashMap matching field ids to field names.
-    pub(crate) fn field_id_to_name_map(&self) -> &HashMap<i32, String> {
+    pub fn field_id_to_name_map(&self) -> &HashMap<i32, String> {
         &self.id_to_name
+    }
+
+    /// Return a hashmap matching field ids to nested fields.
+    pub fn field_id_to_fields(&self) -> &HashMap<i32, NestedFieldRef> {
+        &self.id_to_field
     }
 }
 
@@ -419,7 +425,7 @@ impl Display for Schema {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "table {{")?;
         for field in self.as_struct().fields() {
-            writeln!(f, "  {}", field)?;
+            writeln!(f, "  {field}")?;
         }
         writeln!(f, "}}")
     }
@@ -725,8 +731,7 @@ table {
             assert_eq!(
                 Some(name),
                 schema.name_by_field_id(id),
-                "Column name for field id {} not match.",
-                id
+                "Column name for field id {id} not match."
             );
         }
     }
@@ -748,8 +753,7 @@ table {
             assert_eq!(
                 Some(name),
                 schema.name_by_field_id(id),
-                "Column name for field id {} not match.",
-                id
+                "Column name for field id {id} not match."
             );
         }
     }
@@ -950,8 +954,7 @@ table {
             assert_eq!(
                 Some(&field),
                 schema.field_by_id(id).map(|f| f.as_ref()),
-                "Field for {} not match.",
-                id
+                "Field for {id} not match."
             );
         }
     }

@@ -18,16 +18,18 @@
 //! Integration tests for rest catalog.
 
 use futures::TryStreamExt;
-use iceberg::ErrorKind::FeatureUnsupported;
-use iceberg::{Catalog, TableIdent};
-use iceberg_catalog_rest::RestCatalog;
+use iceberg::{Catalog, CatalogBuilder, TableIdent};
+use iceberg_catalog_rest::RestCatalogBuilder;
 
 use crate::get_shared_containers;
 
 #[tokio::test]
 async fn test_read_table_with_positional_deletes() {
     let fixture = get_shared_containers();
-    let rest_catalog = RestCatalog::new(fixture.catalog_config.clone());
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
 
     let table = rest_catalog
         .load_table(
@@ -37,12 +39,8 @@ async fn test_read_table_with_positional_deletes() {
         .await
         .unwrap();
 
-    let scan = table
-        .scan()
-        .with_delete_file_processing_enabled(true)
-        .build()
-        .unwrap();
-    println!("{:?}", scan);
+    let scan = table.scan().build().unwrap();
+    println!("{scan:?}");
 
     let plan: Vec<_> = scan
         .plan_files()
@@ -51,21 +49,15 @@ async fn test_read_table_with_positional_deletes() {
         .try_collect()
         .await
         .unwrap();
-    println!("{:?}", plan);
+    println!("{plan:?}");
 
     // Scan plan phase should include delete files in file plan
     // when with_delete_file_processing_enabled == true
-    assert_eq!(plan[0].deletes.len(), 2);
+    assert_eq!(plan[0].deletes.len(), 1);
 
-    // 😱 If we don't support positional deletes, we should fail when we try to read a table that
-    // has positional deletes. The table has 12 rows, and 2 are deleted, see provision.py
-    let result = scan.to_arrow().await.unwrap().try_collect::<Vec<_>>().await;
-
-    assert!(result.is_err_and(|e| e.kind() == FeatureUnsupported));
-
-    // When we get support for it:
-    // let batch_stream = scan.to_arrow().await.unwrap();
-    // let batches: Vec<_> = batch_stream.try_collect().await.is_err();
-    // let num_rows: usize = batches.iter().map(|v| v.num_rows()).sum();
-    // assert_eq!(num_rows, 10);
+    // we should see two rows deleted, returning 10 rows instead of 12
+    let batch_stream = scan.to_arrow().await.unwrap();
+    let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
+    let num_rows: usize = batches.iter().map(|v| v.num_rows()).sum();
+    assert_eq!(num_rows, 10);
 }

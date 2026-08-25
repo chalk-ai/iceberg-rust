@@ -17,27 +17,38 @@
 
 //! Catalog API for Apache Iceberg
 
+pub mod memory;
+mod metadata_location;
+
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
+use std::future::Future;
 use std::mem::take;
 use std::ops::Deref;
+use std::str::FromStr;
+use std::sync::Arc;
 
-use _serde::deserialize_snapshot;
+use _serde::{deserialize_snapshot, serialize_snapshot};
 use async_trait::async_trait;
+pub use memory::MemoryCatalog;
+pub use metadata_location::*;
+#[cfg(test)]
+use mockall::automock;
 use serde_derive::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 use uuid::Uuid;
 
 use crate::spec::{
-    FormatVersion, PartitionStatisticsFile, Schema, SchemaId, Snapshot, SnapshotReference,
-    SortOrder, StatisticsFile, TableMetadata, TableMetadataBuilder, UnboundPartitionSpec,
-    ViewFormatVersion, ViewRepresentations, ViewVersion,
+    EncryptedKey, FormatVersion, PartitionStatisticsFile, Schema, SchemaId, Snapshot,
+    SnapshotReference, SortOrder, StatisticsFile, TableMetadata, TableMetadataBuilder,
+    UnboundPartitionSpec, ViewFormatVersion, ViewRepresentations, ViewVersion,
 };
 use crate::table::Table;
 use crate::{Error, ErrorKind, Result};
 
 /// The catalog API for Iceberg Rust.
 #[async_trait]
+#[cfg_attr(test, automock)]
 pub trait Catalog: Debug + Sync + Send {
     /// List namespaces inside the catalog.
     async fn list_namespaces(&self, parent: Option<&NamespaceIdent>)
@@ -92,14 +103,29 @@ pub trait Catalog: Debug + Sync + Send {
     /// Rename a table in the catalog.
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()>;
 
+    /// Register an existing table to the catalog.
+    async fn register_table(&self, table: &TableIdent, metadata_location: String) -> Result<Table>;
+
     /// Update a table to the catalog.
     async fn update_table(&self, commit: TableCommit) -> Result<Table>;
+}
+
+/// Common interface for all catalog builders.
+pub trait CatalogBuilder: Default + Debug + Send + Sync {
+    /// The catalog type that this builder creates.
+    type C: Catalog;
+    /// Create a new catalog instance.
+    fn load(
+        self,
+        name: impl Into<String>,
+        props: HashMap<String, String>,
+    ) -> impl Future<Output = Result<Self::C>> + Send;
 }
 
 /// NamespaceIdent represents the identifier of a namespace in the catalog.
 ///
 /// The namespace identifier is a list of strings, where each string is a
-/// component of the namespace. It's catalog implementer's responsibility to
+/// component of the namespace. It's the catalog implementer's responsibility to
 /// handle the namespace identifier correctly.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NamespaceIdent(Vec<String>);
@@ -199,7 +225,7 @@ impl Display for NamespaceIdent {
 }
 
 /// TableIdent represents the identifier of a table in the catalog.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TableIdent {
     /// Namespace of the table.
     pub namespace: NamespaceIdent,
@@ -265,6 +291,9 @@ pub struct TableCreation {
         props.into_iter().collect()
     }))]
     pub properties: HashMap<String, String>,
+    /// Format version of the table. Defaults to V2.
+    #[builder(default = FormatVersion::V2)]
+    pub format_version: FormatVersion,
 }
 
 /// TableCommit represents the commit of a table in the catalog.
@@ -299,6 +328,39 @@ impl TableCommit {
     /// Take all updates.
     pub fn take_updates(&mut self) -> Vec<TableUpdate> {
         take(&mut self.updates)
+    }
+
+    /// Applies this [`TableCommit`] to the given [`Table`] as part of a catalog update.
+    /// Typically used by [`Catalog::update_table`] to validate requirements and apply metadata updates.
+    ///
+    /// Returns a new [`Table`] with updated metadata,
+    /// or an error if validation or application fails.
+    pub fn apply(self, table: Table) -> Result<Table> {
+        // check requirements
+        for requirement in self.requirements {
+            requirement.check(Some(table.metadata()))?;
+        }
+
+        // get current metadata location
+        let current_metadata_location = table.metadata_location_result()?;
+
+        // apply updates to metadata builder
+        let mut metadata_builder = table
+            .metadata()
+            .clone()
+            .into_builder(Some(current_metadata_location.to_string()));
+        for update in self.updates {
+            metadata_builder = update.apply(metadata_builder)?;
+        }
+
+        // Bump the version of metadata
+        let new_metadata_location = MetadataLocation::from_str(current_metadata_location)?
+            .with_next_version()
+            .to_string();
+
+        Ok(table
+            .with_metadata(Arc::new(metadata_builder.build()?.metadata))
+            .with_metadata_location(new_metadata_location))
     }
 }
 
@@ -420,7 +482,10 @@ pub enum TableUpdate {
     #[serde(rename_all = "kebab-case")]
     AddSnapshot {
         /// Snapshot to add.
-        #[serde(deserialize_with = "deserialize_snapshot")]
+        #[serde(
+            deserialize_with = "deserialize_snapshot",
+            serialize_with = "serialize_snapshot"
+        )]
         snapshot: Snapshot,
     },
     /// Set table's snapshot ref.
@@ -495,6 +560,18 @@ pub enum TableUpdate {
         /// Schema IDs to remove.
         schema_ids: Vec<i32>,
     },
+    /// Add an encryption key
+    #[serde(rename_all = "kebab-case")]
+    AddEncryptionKey {
+        /// The encryption key to add.
+        encryption_key: EncryptedKey,
+    },
+    /// Remove an encryption key
+    #[serde(rename_all = "kebab-case")]
+    RemoveEncryptionKey {
+        /// The id of the encryption key to remove.
+        key_id: String,
+    },
 }
 
 impl TableUpdate {
@@ -502,7 +579,7 @@ impl TableUpdate {
     pub fn apply(self, builder: TableMetadataBuilder) -> Result<TableMetadataBuilder> {
         match self {
             TableUpdate::AssignUuid { uuid } => Ok(builder.assign_uuid(uuid)),
-            TableUpdate::AddSchema { schema, .. } => Ok(builder.add_schema(schema)),
+            TableUpdate::AddSchema { schema, .. } => Ok(builder.add_schema(schema)?),
             TableUpdate::SetCurrentSchema { schema_id } => builder.set_current_schema(schema_id),
             TableUpdate::AddSpec { spec } => builder.add_partition_spec(spec),
             TableUpdate::SetDefaultSpec { spec_id } => builder.set_default_partition_spec(spec_id),
@@ -539,6 +616,12 @@ impl TableUpdate {
                 Ok(builder.remove_partition_statistics(snapshot_id))
             }
             TableUpdate::RemoveSchemas { schema_ids } => builder.remove_schemas(&schema_ids),
+            TableUpdate::AddEncryptionKey { encryption_key } => {
+                Ok(builder.add_encryption_key(encryption_key))
+            }
+            TableUpdate::RemoveEncryptionKey { key_id } => {
+                Ok(builder.remove_encryption_key(&key_id))
+            }
         }
     }
 }
@@ -553,32 +636,35 @@ impl TableRequirement {
             match self {
                 TableRequirement::NotExist => {
                     return Err(Error::new(
-                        ErrorKind::DataInvalid,
+                        ErrorKind::CatalogCommitConflicts,
                         format!(
                             "Requirement failed: Table with id {} already exists",
                             metadata.uuid()
                         ),
-                    ));
+                    )
+                    .with_retryable(true));
                 }
                 TableRequirement::UuidMatch { uuid } => {
                     if &metadata.uuid() != uuid {
                         return Err(Error::new(
-                            ErrorKind::DataInvalid,
+                            ErrorKind::CatalogCommitConflicts,
                             "Requirement failed: Table UUID does not match",
                         )
                         .with_context("expected", *uuid)
-                        .with_context("found", metadata.uuid()));
+                        .with_context("found", metadata.uuid())
+                        .with_retryable(true));
                     }
                 }
                 TableRequirement::CurrentSchemaIdMatch { current_schema_id } => {
                     // ToDo: Harmonize the types of current_schema_id
                     if metadata.current_schema_id != *current_schema_id {
                         return Err(Error::new(
-                            ErrorKind::DataInvalid,
+                            ErrorKind::CatalogCommitConflicts,
                             "Requirement failed: Current schema id does not match",
                         )
                         .with_context("expected", current_schema_id.to_string())
-                        .with_context("found", metadata.current_schema_id.to_string()));
+                        .with_context("found", metadata.current_schema_id.to_string())
+                        .with_retryable(true));
                     }
                 }
                 TableRequirement::DefaultSortOrderIdMatch {
@@ -586,54 +672,54 @@ impl TableRequirement {
                 } => {
                     if metadata.default_sort_order().order_id != *default_sort_order_id {
                         return Err(Error::new(
-                            ErrorKind::DataInvalid,
+                            ErrorKind::CatalogCommitConflicts,
                             "Requirement failed: Default sort order id does not match",
                         )
                         .with_context("expected", default_sort_order_id.to_string())
-                        .with_context(
-                            "found",
-                            metadata.default_sort_order().order_id.to_string(),
-                        ));
+                        .with_context("found", metadata.default_sort_order().order_id.to_string())
+                        .with_retryable(true));
                     }
                 }
                 TableRequirement::RefSnapshotIdMatch { r#ref, snapshot_id } => {
                     let snapshot_ref = metadata.snapshot_for_ref(r#ref);
                     if let Some(snapshot_id) = snapshot_id {
-                        let snapshot_ref = snapshot_ref.ok_or(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("Requirement failed: Branch or tag `{}` not found", r#ref),
-                        ))?;
+                        let snapshot_ref = snapshot_ref.ok_or(
+                            Error::new(
+                                ErrorKind::CatalogCommitConflicts,
+                                format!("Requirement failed: Branch or tag `{ref}` not found"),
+                            )
+                            .with_retryable(true),
+                        )?;
                         if snapshot_ref.snapshot_id() != *snapshot_id {
                             return Err(Error::new(
-                                ErrorKind::DataInvalid,
+                                ErrorKind::CatalogCommitConflicts,
                                 format!(
-                                    "Requirement failed: Branch or tag `{}`'s snapshot has changed",
-                                    r#ref
+                                    "Requirement failed: Branch or tag `{ref}`'s snapshot has changed"
                                 ),
                             )
                             .with_context("expected", snapshot_id.to_string())
-                            .with_context("found", snapshot_ref.snapshot_id().to_string()));
+                            .with_context("found", snapshot_ref.snapshot_id().to_string())
+                            .with_retryable(true));
                         }
                     } else if snapshot_ref.is_some() {
                         // a null snapshot ID means the ref should not exist already
                         return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "Requirement failed: Branch or tag `{}` already exists",
-                                r#ref
-                            ),
-                        ));
+                            ErrorKind::CatalogCommitConflicts,
+                            format!("Requirement failed: Branch or tag `{ref}` already exists"),
+                        )
+                        .with_retryable(true));
                     }
                 }
                 TableRequirement::DefaultSpecIdMatch { default_spec_id } => {
                     // ToDo: Harmonize the types of default_spec_id
                     if metadata.default_partition_spec_id() != *default_spec_id {
                         return Err(Error::new(
-                            ErrorKind::DataInvalid,
+                            ErrorKind::CatalogCommitConflicts,
                             "Requirement failed: Default partition spec id does not match",
                         )
                         .with_context("expected", default_spec_id.to_string())
-                        .with_context("found", metadata.default_partition_spec_id().to_string()));
+                        .with_context("found", metadata.default_partition_spec_id().to_string())
+                        .with_retryable(true));
                     }
                 }
                 TableRequirement::LastAssignedPartitionIdMatch {
@@ -641,11 +727,12 @@ impl TableRequirement {
                 } => {
                     if metadata.last_partition_id != *last_assigned_partition_id {
                         return Err(Error::new(
-                            ErrorKind::DataInvalid,
+                            ErrorKind::CatalogCommitConflicts,
                             "Requirement failed: Last assigned partition id does not match",
                         )
                         .with_context("expected", last_assigned_partition_id.to_string())
-                        .with_context("found", metadata.last_partition_id.to_string()));
+                        .with_context("found", metadata.last_partition_id.to_string())
+                        .with_retryable(true));
                     }
                 }
                 TableRequirement::LastAssignedFieldIdMatch {
@@ -653,11 +740,12 @@ impl TableRequirement {
                 } => {
                     if &metadata.last_column_id != last_assigned_field_id {
                         return Err(Error::new(
-                            ErrorKind::DataInvalid,
+                            ErrorKind::CatalogCommitConflicts,
                             "Requirement failed: Last assigned field id does not match",
                         )
                         .with_context("expected", last_assigned_field_id.to_string())
-                        .with_context("found", metadata.last_column_id.to_string()));
+                        .with_context("found", metadata.last_column_id.to_string())
+                        .with_retryable(true));
                     }
                 }
             };
@@ -666,7 +754,7 @@ impl TableRequirement {
                 TableRequirement::NotExist => {}
                 _ => {
                     return Err(Error::new(
-                        ErrorKind::DataInvalid,
+                        ErrorKind::TableNotFound,
                         "Requirement failed: Table does not exist",
                     ));
                 }
@@ -678,7 +766,7 @@ impl TableRequirement {
 }
 
 pub(super) mod _serde {
-    use serde::{Deserialize as _, Deserializer};
+    use serde::{Deserialize as _, Deserializer, Serialize as _};
 
     use super::*;
     use crate::spec::{SchemaId, Summary};
@@ -691,7 +779,18 @@ pub(super) mod _serde {
         Ok(buf.into())
     }
 
-    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    pub(super) fn serialize_snapshot<S>(
+        snapshot: &Snapshot,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let buf: CatalogSnapshot = snapshot.clone().into();
+        buf.serialize(serializer)
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "kebab-case")]
     /// Defines the structure of a v2 snapshot for the catalog.
     /// Main difference to SnapshotV2 is that sequence-number is optional
@@ -707,6 +806,12 @@ pub(super) mod _serde {
         summary: Summary,
         #[serde(skip_serializing_if = "Option::is_none")]
         schema_id: Option<SchemaId>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_row_id: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        added_rows: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        key_id: Option<String>,
     }
 
     impl From<CatalogSnapshot> for Snapshot {
@@ -719,6 +824,9 @@ pub(super) mod _serde {
                 manifest_list,
                 schema_id,
                 summary,
+                first_row_id,
+                added_rows,
+                key_id,
             } = snapshot;
             let builder = Snapshot::builder()
                 .with_snapshot_id(snapshot_id)
@@ -726,11 +834,49 @@ pub(super) mod _serde {
                 .with_sequence_number(sequence_number)
                 .with_timestamp_ms(timestamp_ms)
                 .with_manifest_list(manifest_list)
-                .with_summary(summary);
-            if let Some(schema_id) = schema_id {
-                builder.with_schema_id(schema_id).build()
-            } else {
-                builder.build()
+                .with_summary(summary)
+                .with_encryption_key_id(key_id);
+            let row_range = first_row_id.zip(added_rows);
+            match (schema_id, row_range) {
+                (None, None) => builder.build(),
+                (Some(schema_id), None) => builder.with_schema_id(schema_id).build(),
+                (None, Some((first_row_id, last_row_id))) => {
+                    builder.with_row_range(first_row_id, last_row_id).build()
+                }
+                (Some(schema_id), Some((first_row_id, last_row_id))) => builder
+                    .with_schema_id(schema_id)
+                    .with_row_range(first_row_id, last_row_id)
+                    .build(),
+            }
+        }
+    }
+
+    impl From<Snapshot> for CatalogSnapshot {
+        fn from(snapshot: Snapshot) -> Self {
+            let first_row_id = snapshot.first_row_id();
+            let added_rows = snapshot.added_rows_count();
+            let Snapshot {
+                snapshot_id,
+                parent_snapshot_id,
+                sequence_number,
+                timestamp_ms,
+                manifest_list,
+                summary,
+                schema_id,
+                row_range: _,
+                encryption_key_id: key_id,
+            } = snapshot;
+            CatalogSnapshot {
+                snapshot_id,
+                parent_snapshot_id,
+                sequence_number,
+                timestamp_ms,
+                manifest_list,
+                summary,
+                schema_id,
+                first_row_id,
+                added_rows,
+                key_id,
             }
         }
     }
@@ -770,7 +916,7 @@ pub enum ViewUpdate {
     #[serde(rename_all = "kebab-case")]
     AssignUuid {
         /// The new UUID to assign.
-        uuid: uuid::Uuid,
+        uuid: Uuid,
     },
     /// Upgrade view's format version
     #[serde(rename_all = "kebab-case")]
@@ -854,13 +1000,13 @@ mod _serde_set_statistics {
             snapshot_id,
             statistics,
         } = SetStatistics::deserialize(deserializer)?;
-        if let Some(snapshot_id) = snapshot_id {
-            if snapshot_id != statistics.snapshot_id {
-                return Err(serde::de::Error::custom(format!(
-                    "Snapshot id to set {snapshot_id} does not match the statistics file snapshot id {}",
-                    statistics.snapshot_id
-                )));
-            }
+        if let Some(snapshot_id) = snapshot_id
+            && snapshot_id != statistics.snapshot_id
+        {
+            return Err(serde::de::Error::custom(format!(
+                "Snapshot id to set {snapshot_id} does not match the statistics file snapshot id {}",
+                statistics.snapshot_id
+            )));
         }
 
         Ok(statistics)
@@ -871,21 +1017,28 @@ mod _serde_set_statistics {
 mod tests {
     use std::collections::HashMap;
     use std::fmt::Debug;
+    use std::fs::File;
+    use std::io::BufReader;
 
+    use base64::Engine as _;
     use serde::Serialize;
     use serde::de::DeserializeOwned;
     use uuid::uuid;
 
     use super::ViewUpdate;
+    use crate::io::FileIOBuilder;
     use crate::spec::{
-        BlobMetadata, FormatVersion, MAIN_BRANCH, NestedField, NullOrder, Operation,
+        BlobMetadata, EncryptedKey, FormatVersion, MAIN_BRANCH, NestedField, NullOrder, Operation,
         PartitionStatisticsFile, PrimitiveType, Schema, Snapshot, SnapshotReference,
         SnapshotRetention, SortDirection, SortField, SortOrder, SqlViewRepresentation,
         StatisticsFile, Summary, TableMetadata, TableMetadataBuilder, Transform, Type,
         UnboundPartitionSpec, ViewFormatVersion, ViewRepresentation, ViewRepresentations,
         ViewVersion,
     };
-    use crate::{NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate};
+    use crate::table::Table;
+    use crate::{
+        NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement, TableUpdate,
+    };
 
     #[test]
     fn test_parent_namespace() {
@@ -1005,20 +1158,18 @@ mod tests {
         assert!(requirement.check(Some(&metadata)).is_ok());
 
         // Add snapshot
-        let record = r#"
-        {
-            "snapshot-id": 3051729675574597004,
-            "sequence-number": 10,
-            "timestamp-ms": 9992191116217,
-            "summary": {
-                "operation": "append"
-            },
-            "manifest-list": "s3://b/wh/.../s1.avro",
-            "schema-id": 0
-        }
-        "#;
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(3051729675574597004)
+            .with_sequence_number(10)
+            .with_timestamp_ms(9992191116217)
+            .with_manifest_list("s3://b/wh/.../s1.avro".to_string())
+            .with_schema_id(0)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
 
-        let snapshot = serde_json::from_str::<Snapshot>(record).unwrap();
         let builder = metadata.into_builder(None);
         let builder = TableUpdate::AddSnapshot {
             snapshot: snapshot.clone(),
@@ -1042,7 +1193,7 @@ mod tests {
         .unwrap()
         .metadata;
 
-        // Ref exists and should matches
+        // Ref exists and should match
         let requirement = TableRequirement::RefSnapshotIdMatch {
             r#ref: "main".to_string(),
             snapshot_id: Some(3051729675574597004),
@@ -1597,6 +1748,50 @@ mod tests {
     }
 
     #[test]
+    fn test_add_snapshot_v3() {
+        let json = serde_json::json!(
+        {
+            "action": "add-snapshot",
+            "snapshot": {
+                "snapshot-id": 3055729675574597000i64,
+                "parent-snapshot-id": 3051729675574597000i64,
+                "timestamp-ms": 1555100955770i64,
+                "first-row-id":0,
+                "added-rows":2,
+                "key-id":"key123",
+                "summary": {
+                    "operation": "append"
+                },
+                "manifest-list": "s3://a/b/2.avro"
+            }
+        });
+
+        let update = TableUpdate::AddSnapshot {
+            snapshot: Snapshot::builder()
+                .with_snapshot_id(3055729675574597000)
+                .with_parent_snapshot_id(Some(3051729675574597000))
+                .with_timestamp_ms(1555100955770)
+                .with_sequence_number(0)
+                .with_manifest_list("s3://a/b/2.avro")
+                .with_row_range(0, 2)
+                .with_encryption_key_id(Some("key123".to_string()))
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: HashMap::default(),
+                })
+                .build(),
+        };
+
+        let actual: TableUpdate = serde_json::from_value(json).expect("Failed to parse from json");
+        assert_eq!(actual, update, "Parsed value is not equal to expected");
+        let restored: TableUpdate = serde_json::from_str(
+            &serde_json::to_string(&actual).expect("Failed to serialize to json"),
+        )
+        .expect("Failed to parse from serialized json");
+        assert_eq!(restored, update);
+    }
+
+    #[test]
     fn test_remove_snapshots() {
         let json = r#"
 {
@@ -2096,6 +2291,118 @@ mod tests {
             TableUpdate::RemoveSchemas {
                 schema_ids: vec![1, 2],
             },
+        );
+    }
+
+    #[test]
+    fn test_add_encryption_key() {
+        let key_bytes = "key".as_bytes();
+        let encoded_key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
+        test_serde_json(
+            format!(
+                r#"
+                {{
+                    "action": "add-encryption-key",
+                    "encryption-key": {{
+                        "key-id": "a",
+                        "encrypted-key-metadata": "{encoded_key}",
+                        "encrypted-by-id": "b"
+                    }}
+                }}        
+            "#
+            ),
+            TableUpdate::AddEncryptionKey {
+                encryption_key: EncryptedKey::builder()
+                    .key_id("a")
+                    .encrypted_key_metadata(key_bytes.to_vec())
+                    .encrypted_by_id("b")
+                    .build(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_remove_encryption_key() {
+        test_serde_json(
+            r#"
+                {
+                    "action": "remove-encryption-key",
+                    "key-id": "a"
+                }        
+            "#,
+            TableUpdate::RemoveEncryptionKey {
+                key_id: "a".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_table_commit() {
+        let table = {
+            let file = File::open(format!(
+                "{}/testdata/table_metadata/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                "TableMetadataV2Valid.json"
+            ))
+            .unwrap();
+            let reader = BufReader::new(file);
+            let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+
+            Table::builder()
+                .metadata(resp)
+                .metadata_location("s3://bucket/test/location/metadata/00000-8a62c37d-4573-4021-952a-c0baef7d21d0.metadata.json".to_string())
+                .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+                .file_io(FileIOBuilder::new("memory").build().unwrap())
+                .build()
+                .unwrap()
+        };
+
+        let updates = vec![
+            TableUpdate::SetLocation {
+                location: "s3://bucket/test/new_location/data".to_string(),
+            },
+            TableUpdate::SetProperties {
+                updates: vec![
+                    ("prop1".to_string(), "v1".to_string()),
+                    ("prop2".to_string(), "v2".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        ];
+
+        let requirements = vec![TableRequirement::UuidMatch {
+            uuid: table.metadata().table_uuid,
+        }];
+
+        let table_commit = TableCommit::builder()
+            .ident(table.identifier().to_owned())
+            .updates(updates)
+            .requirements(requirements)
+            .build();
+
+        let updated_table = table_commit.apply(table).unwrap();
+
+        assert_eq!(
+            updated_table.metadata().properties.get("prop1").unwrap(),
+            "v1"
+        );
+        assert_eq!(
+            updated_table.metadata().properties.get("prop2").unwrap(),
+            "v2"
+        );
+
+        // metadata version should be bumped
+        assert!(
+            updated_table
+                .metadata_location()
+                .unwrap()
+                .starts_with("s3://bucket/test/location/metadata/00001-")
+        );
+
+        assert_eq!(
+            updated_table.metadata().location,
+            "s3://bucket/test/new_location/data",
         );
     }
 }

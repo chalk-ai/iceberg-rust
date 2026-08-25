@@ -22,17 +22,26 @@
 //! ## Scan A Table
 //!
 //! ```rust, no_run
+//! use std::collections::HashMap;
+//!
 //! use futures::TryStreamExt;
 //! use iceberg::io::{FileIO, FileIOBuilder};
-//! use iceberg::{Catalog, Result, TableIdent};
-//! use iceberg_catalog_memory::MemoryCatalog;
+//! use iceberg::memory::MemoryCatalogBuilder;
+//! use iceberg::{Catalog, CatalogBuilder, MemoryCatalog, Result, TableIdent};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<()> {
-//!     // Build your file IO.
-//!     let file_io = FileIOBuilder::new("memory").build()?;
 //!     // Connect to a catalog.
-//!     let catalog = MemoryCatalog::new(file_io, None);
+//!     use iceberg::memory::MEMORY_CATALOG_WAREHOUSE;
+//!     let catalog = MemoryCatalogBuilder::default()
+//!         .load(
+//!             "memory",
+//!             HashMap::from([(
+//!                 MEMORY_CATALOG_WAREHOUSE.to_string(),
+//!                 "file:///path/to/warehouse".to_string(),
+//!             )]),
+//!         )
+//!         .await?;
 //!     // Load table from catalog.
 //!     let table = catalog
 //!         .load_table(&TableIdent::from_strs(["hello", "world"])?)
@@ -62,10 +71,7 @@ pub use error::{Error, ErrorKind, Result};
 
 mod catalog;
 
-pub use catalog::{
-    Catalog, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement,
-    TableUpdate, ViewCreation,
-};
+pub use catalog::*;
 
 pub mod table;
 
@@ -85,8 +91,10 @@ mod runtime;
 
 pub mod arrow;
 pub(crate) mod delete_file_index;
+pub mod test_utils;
 mod utils;
 pub mod writer;
 
 mod delete_vector;
+pub mod metadata_columns;
 pub mod puffin;

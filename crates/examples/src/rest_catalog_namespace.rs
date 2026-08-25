@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 
-use iceberg::{Catalog, NamespaceIdent};
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 
 static REST_URI: &str = "http://localhost:8181";
 
@@ -33,19 +33,19 @@ static REST_URI: &str = "http://localhost:8181";
 async fn main() {
     // ANCHOR: create_catalog
     // Create the REST iceberg catalog.
-    let config = RestCatalogConfig::builder()
-        .uri(REST_URI.to_string())
-        .build();
-    let catalog = RestCatalog::new(config);
+    let catalog = RestCatalogBuilder::default()
+        .load(
+            "rest",
+            HashMap::from([(REST_CATALOG_PROP_URI.to_string(), REST_URI.to_string())]),
+        )
+        .await
+        .unwrap();
     // ANCHOR_END: create_catalog
 
     // ANCHOR: list_all_namespace
     // List all namespaces already in the catalog.
     let existing_namespaces = catalog.list_namespaces(None).await.unwrap();
-    println!(
-        "Namespaces alreading in the existing catalog: {:?}",
-        existing_namespaces
-    );
+    println!("Namespaces alreading in the existing catalog: {existing_namespaces:?}");
     // ANCHOR_END: list_all_namespace
 
     // ANCHOR: create_namespace
@@ -67,9 +67,9 @@ async fn main() {
         )
         .await
         .unwrap();
-    println!("Namespace {:?} created!", namespace_ident);
+    println!("Namespace {namespace_ident:?} created!");
 
     let loaded_namespace = catalog.get_namespace(&namespace_ident).await.unwrap();
-    println!("Namespace loaded!\n\nNamespace: {:#?}", loaded_namespace,);
+    println!("Namespace loaded!\n\nNamespace: {loaded_namespace:#?}",);
     // ANCHOR_END: create_namespace
 }

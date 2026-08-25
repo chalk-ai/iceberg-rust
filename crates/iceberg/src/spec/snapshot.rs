@@ -21,7 +21,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use _serde::SnapshotV2;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
@@ -29,7 +28,7 @@ use typed_builder::TypedBuilder;
 use super::table_metadata::SnapshotLog;
 use crate::error::{Result, timestamp_ms_to_utc};
 use crate::io::FileIO;
-use crate::spec::{ManifestList, SchemaId, SchemaRef, StructType, TableMetadata};
+use crate::spec::{ManifestList, SchemaId, SchemaRef, TableMetadata};
 use crate::{Error, ErrorKind};
 
 /// The ref name of the main branch of the table.
@@ -82,33 +81,52 @@ impl Default for Operation {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, TypedBuilder)]
-#[serde(from = "SnapshotV2", into = "SnapshotV2")]
+#[derive(Debug, PartialEq, Eq, Clone)]
+/// Row range of a snapshot, contains first_row_id and added_rows_count.
+pub struct SnapshotRowRange {
+    /// The first _row_id assigned to the first row in the first data file in the first manifest.
+    pub first_row_id: u64,
+    /// The upper bound of the number of rows with assigned row IDs
+    pub added_rows: u64,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, TypedBuilder)]
 #[builder(field_defaults(setter(prefix = "with_")))]
 /// A snapshot represents the state of a table at some time and is used to access the complete set of data files in the table.
 pub struct Snapshot {
     /// A unique long ID
-    snapshot_id: i64,
+    pub(crate) snapshot_id: i64,
     /// The snapshot ID of the snapshot’s parent.
     /// Omitted for any snapshot with no parent
     #[builder(default = None)]
-    parent_snapshot_id: Option<i64>,
+    pub(crate) parent_snapshot_id: Option<i64>,
     /// A monotonically increasing long that tracks the order of
     /// changes to a table.
-    sequence_number: i64,
+    pub(crate) sequence_number: i64,
     /// A timestamp when the snapshot was created, used for garbage
     /// collection and table inspection
-    timestamp_ms: i64,
+    pub(crate) timestamp_ms: i64,
     /// The location of a manifest list for this snapshot that
     /// tracks manifest files with additional metadata.
     /// Currently we only support manifest list file, and manifest files are not supported.
     #[builder(setter(into))]
-    manifest_list: String,
+    pub(crate) manifest_list: String,
     /// A string map that summarizes the snapshot changes, including operation.
-    summary: Summary,
+    pub(crate) summary: Summary,
     /// ID of the table’s current schema when the snapshot was created.
     #[builder(setter(strip_option(fallback = schema_id_opt)), default = None)]
-    schema_id: Option<SchemaId>,
+    pub(crate) schema_id: Option<SchemaId>,
+    /// Encryption Key ID
+    #[builder(default)]
+    pub(crate) encryption_key_id: Option<String>,
+    /// Row range of this snapshot, required when the table version supports row lineage.
+    /// Specify as a tuple of (first_row_id, added_rows_count)
+    #[builder(default, setter(!strip_option, transform = |first_row_id: u64, added_rows: u64| Some(SnapshotRowRange { first_row_id, added_rows })))]
+    // This is specified as a struct instead of two separate fields to ensure that both fields are either set or not set.
+    // The java implementations uses two separate fields, then sets `added_row_counts` to Null if `first_row_id` is set to Null.
+    // It throws an error if `added_row_counts` is set but `first_row_id` is not set, or if either of the two is negative.
+    // We handle all cases infallible using the rust type system.
+    pub(crate) row_range: Option<SnapshotRowRange>,
 }
 
 impl Snapshot {
@@ -166,7 +184,7 @@ impl Snapshot {
                 .ok_or_else(|| {
                     Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Schema with id {} not found", schema_id),
+                        format!("Schema with id {schema_id} not found"),
                     )
                 })?
                 .clone(),
@@ -190,20 +208,11 @@ impl Snapshot {
         table_metadata: &TableMetadata,
     ) -> Result<ManifestList> {
         let manifest_list_content = file_io.new_input(&self.manifest_list)?.read().await?;
-
-        let schema = self.schema(table_metadata)?;
-
-        let partition_type_provider = |partition_spec_id: i32| -> Result<Option<StructType>> {
-            table_metadata
-                .partition_spec_by_id(partition_spec_id)
-                .map(|partition_spec| partition_spec.partition_type(&schema))
-                .transpose()
-        };
-
         ManifestList::parse_with_version(
             &manifest_list_content,
+            // TODO: You don't really need the version since you could just project any Avro in
+            // the version that you'd like to get (probably always the latest)
             table_metadata.format_version(),
-            partition_type_provider,
         )
     }
 
@@ -213,6 +222,37 @@ impl Snapshot {
             timestamp_ms: self.timestamp_ms,
             snapshot_id: self.snapshot_id,
         }
+    }
+
+    /// The row-id of the first newly added row in this snapshot. All rows added in this snapshot will
+    /// have a row-id assigned to them greater than this value. All rows with a row-id less than this
+    /// value were created in a snapshot that was added to the table (but not necessarily committed to
+    /// this branch) in the past.
+    ///
+    /// This field is optional but is required when the table version supports row lineage.
+    pub fn first_row_id(&self) -> Option<u64> {
+        self.row_range.as_ref().map(|r| r.first_row_id)
+    }
+
+    /// The total number of newly added rows in this snapshot. It should be the summation of {@link
+    /// ManifestFile#ADDED_ROWS_COUNT} for every manifest added in this snapshot.
+    ///
+    /// This field is optional but is required when the table version supports row lineage.
+    pub fn added_rows_count(&self) -> Option<u64> {
+        self.row_range.as_ref().map(|r| r.added_rows)
+    }
+
+    /// Returns the row range of this snapshot, if available.
+    /// This is a tuple containing (first_row_id, added_rows_count).
+    pub fn row_range(&self) -> Option<(u64, u64)> {
+        self.row_range
+            .as_ref()
+            .map(|r| (r.first_row_id, r.added_rows))
+    }
+
+    /// Get encryption key id, if available.
+    pub fn encryption_key_id(&self) -> Option<&str> {
+        self.encryption_key_id.as_deref()
     }
 }
 
@@ -226,8 +266,28 @@ pub(super) mod _serde {
     use serde::{Deserialize, Serialize};
 
     use super::{Operation, Snapshot, Summary};
-    use crate::Error;
     use crate::spec::SchemaId;
+    use crate::spec::snapshot::SnapshotRowRange;
+    use crate::{Error, ErrorKind};
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    /// Defines the structure of a v2 snapshot for serialization/deserialization
+    pub(crate) struct SnapshotV3 {
+        pub snapshot_id: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub parent_snapshot_id: Option<i64>,
+        pub sequence_number: i64,
+        pub timestamp_ms: i64,
+        pub manifest_list: String,
+        pub summary: Summary,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub schema_id: Option<SchemaId>,
+        pub first_row_id: u64,
+        pub added_rows: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub key_id: Option<String>,
+    }
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "kebab-case")]
@@ -262,6 +322,51 @@ pub(super) mod _serde {
         pub schema_id: Option<SchemaId>,
     }
 
+    impl From<SnapshotV3> for Snapshot {
+        fn from(s: SnapshotV3) -> Self {
+            Snapshot {
+                snapshot_id: s.snapshot_id,
+                parent_snapshot_id: s.parent_snapshot_id,
+                sequence_number: s.sequence_number,
+                timestamp_ms: s.timestamp_ms,
+                manifest_list: s.manifest_list,
+                summary: s.summary,
+                schema_id: s.schema_id,
+                encryption_key_id: s.key_id,
+                row_range: Some(SnapshotRowRange {
+                    first_row_id: s.first_row_id,
+                    added_rows: s.added_rows,
+                }),
+            }
+        }
+    }
+
+    impl TryFrom<Snapshot> for SnapshotV3 {
+        type Error = Error;
+
+        fn try_from(s: Snapshot) -> Result<Self, Self::Error> {
+            let row_range = s.row_range.ok_or_else(|| {
+                Error::new(
+                    crate::ErrorKind::DataInvalid,
+                    "v3 Snapshots must have first-row-id and rows-added fields set.".to_string(),
+                )
+            })?;
+
+            Ok(SnapshotV3 {
+                snapshot_id: s.snapshot_id,
+                parent_snapshot_id: s.parent_snapshot_id,
+                sequence_number: s.sequence_number,
+                timestamp_ms: s.timestamp_ms,
+                manifest_list: s.manifest_list,
+                summary: s.summary,
+                schema_id: s.schema_id,
+                first_row_id: row_range.first_row_id,
+                added_rows: row_range.added_rows,
+                key_id: s.encryption_key_id,
+            })
+        }
+    }
+
     impl From<SnapshotV2> for Snapshot {
         fn from(v2: SnapshotV2) -> Self {
             Snapshot {
@@ -272,6 +377,8 @@ pub(super) mod _serde {
                 manifest_list: v2.manifest_list,
                 summary: v2.summary,
                 schema_id: v2.schema_id,
+                encryption_key_id: None,
+                row_range: None,
             }
         }
     }
@@ -301,14 +408,26 @@ pub(super) mod _serde {
                 timestamp_ms: v1.timestamp_ms,
                 manifest_list: match (v1.manifest_list, v1.manifests) {
                     (Some(file), None) => file,
-                    (Some(_), Some(_)) => "Invalid v1 snapshot, when manifest list provided, manifest files should be omitted".to_string(),
-                    (None, _) => "Unsupported v1 snapshot, only manifest list is supported".to_string()
-                   },
+                    (Some(_), Some(_)) => {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "Invalid v1 snapshot, when manifest list provided, manifest files should be omitted",
+                        ));
+                    }
+                    (None, _) => {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "Unsupported v1 snapshot, only manifest list is supported",
+                        ));
+                    }
+                },
                 summary: v1.summary.unwrap_or(Summary {
                     operation: Operation::default(),
                     additional_properties: HashMap::new(),
                 }),
                 schema_id: v1.schema_id,
+                encryption_key_id: None,
+                row_range: None,
             })
         }
     }
@@ -408,6 +527,7 @@ mod tests {
 
     use chrono::{TimeZone, Utc};
 
+    use crate::spec::TableMetadata;
     use crate::spec::snapshot::_serde::SnapshotV1;
     use crate::spec::snapshot::{Operation, Snapshot, Summary};
 
@@ -443,5 +563,173 @@ mod tests {
             *result.summary()
         );
         assert_eq!("s3://b/wh/.../s1.avro".to_string(), *result.manifest_list());
+    }
+
+    #[test]
+    fn test_snapshot_v1_to_v2_projection() {
+        use crate::spec::snapshot::_serde::SnapshotV1;
+
+        // Create a V1 snapshot (without sequence-number field)
+        let v1_snapshot = SnapshotV1 {
+            snapshot_id: 1234567890,
+            parent_snapshot_id: Some(987654321),
+            timestamp_ms: 1515100955770,
+            manifest_list: Some("s3://bucket/manifest-list.avro".to_string()),
+            manifests: None, // V1 can have either manifest_list or manifests, but not both
+            summary: Some(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::from([
+                    ("added-files".to_string(), "5".to_string()),
+                    ("added-records".to_string(), "100".to_string()),
+                ]),
+            }),
+            schema_id: Some(1),
+        };
+
+        // Convert V1 to V2 - this should apply defaults for missing V2 fields
+        let v2_snapshot: Snapshot = v1_snapshot.try_into().unwrap();
+
+        // Verify V1→V2 projection defaults are applied correctly
+        assert_eq!(
+            v2_snapshot.sequence_number(),
+            0,
+            "V1 snapshot sequence_number should default to 0"
+        );
+
+        // Verify other fields are preserved correctly during conversion
+        assert_eq!(v2_snapshot.snapshot_id(), 1234567890);
+        assert_eq!(v2_snapshot.parent_snapshot_id(), Some(987654321));
+        assert_eq!(v2_snapshot.timestamp_ms(), 1515100955770);
+        assert_eq!(
+            v2_snapshot.manifest_list(),
+            "s3://bucket/manifest-list.avro"
+        );
+        assert_eq!(v2_snapshot.schema_id(), Some(1));
+        assert_eq!(v2_snapshot.summary().operation, Operation::Append);
+        assert_eq!(
+            v2_snapshot
+                .summary()
+                .additional_properties
+                .get("added-files"),
+            Some(&"5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_v1_snapshot_with_manifest_list_and_manifests() {
+        {
+            let metadata = r#"
+    {
+        "format-version": 1,
+        "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+        "location": "s3://bucket/test/location",
+        "last-updated-ms": 1700000000000,
+        "last-column-id": 1,
+        "schema": {
+            "type": "struct",
+            "fields": [
+                {"id": 1, "name": "x", "required": true, "type": "long"}
+            ]
+        },
+        "partition-spec": [],
+        "properties": {},
+        "current-snapshot-id": 111111111,
+        "snapshots": [
+            {
+                "snapshot-id": 111111111,
+                "timestamp-ms": 1600000000000,
+                "summary": {"operation": "append"},
+                "manifest-list": "s3://bucket/metadata/snap-123.avro",
+                "manifests": ["s3://bucket/metadata/manifest-1.avro"]
+            }
+        ]
+    }
+    "#;
+
+            let result_both_manifest_list_and_manifest_set =
+                serde_json::from_str::<TableMetadata>(metadata);
+            assert!(result_both_manifest_list_and_manifest_set.is_err());
+            assert_eq!(
+                result_both_manifest_list_and_manifest_set
+                    .unwrap_err()
+                    .to_string(),
+                "DataInvalid => Invalid v1 snapshot, when manifest list provided, manifest files should be omitted"
+            )
+        }
+
+        {
+            let metadata = r#"
+    {
+        "format-version": 1,
+        "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+        "location": "s3://bucket/test/location",
+        "last-updated-ms": 1700000000000,
+        "last-column-id": 1,
+        "schema": {
+            "type": "struct",
+            "fields": [
+                {"id": 1, "name": "x", "required": true, "type": "long"}
+            ]
+        },
+        "partition-spec": [],
+        "properties": {},
+        "current-snapshot-id": 111111111,
+        "snapshots": [
+            {
+                "snapshot-id": 111111111,
+                "timestamp-ms": 1600000000000,
+                "summary": {"operation": "append"},
+                "manifests": ["s3://bucket/metadata/manifest-1.avro"]
+            }
+        ]
+    }
+    "#;
+            let result_missing_manifest_list = serde_json::from_str::<TableMetadata>(metadata);
+            assert!(result_missing_manifest_list.is_err());
+            assert_eq!(
+                result_missing_manifest_list.unwrap_err().to_string(),
+                "DataInvalid => Unsupported v1 snapshot, only manifest list is supported"
+            )
+        }
+    }
+
+    #[test]
+    fn test_snapshot_v1_to_v2_with_missing_summary() {
+        use crate::spec::snapshot::_serde::SnapshotV1;
+
+        // Create a V1 snapshot without summary (should get default)
+        let v1_snapshot = SnapshotV1 {
+            snapshot_id: 1111111111,
+            parent_snapshot_id: None,
+            timestamp_ms: 1515100955770,
+            manifest_list: Some("s3://bucket/manifest-list.avro".to_string()),
+            manifests: None,
+            summary: None, // V1 summary is optional
+            schema_id: None,
+        };
+
+        // Convert V1 to V2 - this should apply default summary
+        let v2_snapshot: Snapshot = v1_snapshot.try_into().unwrap();
+
+        // Verify defaults are applied correctly
+        assert_eq!(
+            v2_snapshot.sequence_number(),
+            0,
+            "V1 snapshot sequence_number should default to 0"
+        );
+        assert_eq!(
+            v2_snapshot.summary().operation,
+            Operation::Append,
+            "Missing V1 summary should default to Append operation"
+        );
+        assert!(
+            v2_snapshot.summary().additional_properties.is_empty(),
+            "Default summary should have empty additional_properties"
+        );
+
+        // Verify other fields
+        assert_eq!(v2_snapshot.snapshot_id(), 1111111111);
+        assert_eq!(v2_snapshot.parent_snapshot_id(), None);
+        assert_eq!(v2_snapshot.schema_id(), None);
     }
 }

@@ -22,16 +22,16 @@ use uuid::Uuid;
 
 use super::{
     DEFAULT_PARTITION_SPEC_ID, DEFAULT_SCHEMA_ID, FormatVersion, MAIN_BRANCH, MetadataLog,
-    ONE_MINUTE_MS, PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX,
-    PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX_DEFAULT, PartitionSpec, PartitionSpecBuilder,
-    PartitionStatisticsFile, RESERVED_PROPERTIES, Schema, SchemaRef, Snapshot, SnapshotLog,
-    SnapshotReference, SnapshotRetention, SortOrder, SortOrderRef, StatisticsFile, StructType,
-    TableMetadata, UNPARTITIONED_LAST_ASSIGNED_ID, UnboundPartitionSpec,
+    ONE_MINUTE_MS, PartitionSpec, PartitionSpecBuilder, PartitionStatisticsFile, Schema, SchemaRef,
+    Snapshot, SnapshotLog, SnapshotReference, SnapshotRetention, SortOrder, SortOrderRef,
+    StatisticsFile, StructType, TableMetadata, TableProperties, UNPARTITIONED_LAST_ASSIGNED_ID,
+    UnboundPartitionSpec,
 };
 use crate::error::{Error, ErrorKind, Result};
+use crate::spec::{EncryptedKey, INITIAL_ROW_ID, MIN_FORMAT_VERSION_ROW_LINEAGE};
 use crate::{TableCreation, TableUpdate};
 
-const FIRST_FIELD_ID: u32 = 1;
+pub(crate) const FIRST_FIELD_ID: i32 = 1;
 
 /// Manipulating table metadata.
 ///
@@ -121,6 +121,7 @@ impl TableMetadataBuilder {
                 statistics: HashMap::new(),
                 partition_statistics: HashMap::new(),
                 encryption_keys: HashMap::new(),
+                next_row_id: INITIAL_ROW_ID,
             },
             last_updated_ms: None,
             changes: vec![],
@@ -171,6 +172,7 @@ impl TableMetadataBuilder {
             partition_spec,
             sort_order,
             properties,
+            format_version,
         } = table_creation;
 
         let location = location.ok_or_else(|| {
@@ -189,7 +191,7 @@ impl TableMetadataBuilder {
             partition_spec,
             sort_order.unwrap_or(SortOrder::unsorted_order()),
             location,
-            FormatVersion::V2,
+            format_version,
             properties,
         )
     }
@@ -229,6 +231,11 @@ impl TableMetadataBuilder {
                     self.changes
                         .push(TableUpdate::UpgradeFormatVersion { format_version });
                 }
+                FormatVersion::V3 => {
+                    self.metadata.format_version = format_version;
+                    self.changes
+                        .push(TableUpdate::UpgradeFormatVersion { format_version });
+                }
             }
         }
 
@@ -247,7 +254,7 @@ impl TableMetadataBuilder {
         // List of specified properties that are RESERVED and should not be persisted.
         let reserved_properties = properties
             .keys()
-            .filter(|key| RESERVED_PROPERTIES.contains(&key.as_str()))
+            .filter(|key| TableProperties::RESERVED_PROPERTIES.contains(&key.as_str()))
             .map(ToString::to_string)
             .collect::<Vec<_>>();
 
@@ -285,7 +292,7 @@ impl TableMetadataBuilder {
         // disallow removal of reserved properties
         let reserved_properties = properties
             .iter()
-            .filter(|key| RESERVED_PROPERTIES.contains(&key.as_str()))
+            .filter(|key| TableProperties::RESERVED_PROPERTIES.contains(&key.as_str()))
             .map(ToString::to_string)
             .collect::<Vec<_>>();
 
@@ -330,6 +337,9 @@ impl TableMetadataBuilder {
     /// # Errors
     /// - Snapshot id already exists.
     /// - For format version > 1: the sequence number of the snapshot is lower than the highest sequence number specified so far.
+    /// - For format version >= 3: the first-row-id of the snapshot is lower than the next-row-id of the table.
+    /// - For format version >= 3: added-rows is null or first-row-id is null.
+    /// - For format version >= 3: next-row-id would overflow when adding added-rows.
     pub fn add_snapshot(mut self, snapshot: Snapshot) -> Result<Self> {
         if self
             .metadata
@@ -384,6 +394,43 @@ impl TableMetadataBuilder {
                     max_last_updated
                 ),
             ));
+        }
+
+        let mut added_rows = None;
+        if self.metadata.format_version >= MIN_FORMAT_VERSION_ROW_LINEAGE {
+            if let Some((first_row_id, added_rows_count)) = snapshot.row_range() {
+                if first_row_id < self.metadata.next_row_id {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot add a snapshot, first-row-id is behind table next-row-id: {first_row_id} < {}",
+                            self.metadata.next_row_id
+                        ),
+                    ));
+                }
+
+                added_rows = Some(added_rows_count);
+            } else {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot add a snapshot: first-row-id is null. first-row-id must be set for format version >= {MIN_FORMAT_VERSION_ROW_LINEAGE}",
+                    ),
+                ));
+            }
+        }
+
+        if let Some(added_rows) = added_rows {
+            self.metadata.next_row_id = self
+                .metadata
+                .next_row_id
+                .checked_add(added_rows)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Cannot add snapshot: next-row-id overflowed when adding added-rows",
+                    )
+                })?;
         }
 
         // Mutation happens in next line - must be infallible from here
@@ -525,7 +572,6 @@ impl TableMetadataBuilder {
     pub fn remove_ref(mut self, ref_name: &str) -> Self {
         if ref_name == MAIN_BRANCH {
             self.metadata.current_snapshot_id = None;
-            self.metadata.snapshot_log.clear();
         }
 
         if self.metadata.refs.remove(ref_name).is_some() || ref_name == MAIN_BRANCH {
@@ -589,7 +635,10 @@ impl TableMetadataBuilder {
     ///
     /// Important: Use this method with caution. The builder does not check
     /// if the added schema is compatible with the current schema.
-    pub fn add_schema(mut self, schema: Schema) -> Self {
+    pub fn add_schema(mut self, schema: Schema) -> Result<Self> {
+        // Validate that new schema fields don't conflict with existing partition field names
+        self.validate_schema_field_names(&schema)?;
+
         let new_schema_id = self.reuse_or_create_new_schema_id(&schema);
         let schema_found = self.metadata.schemas.contains_key(&new_schema_id);
 
@@ -601,7 +650,7 @@ impl TableMetadataBuilder {
                 self.last_added_schema_id = Some(new_schema_id);
             }
 
-            return self;
+            return Ok(self);
         }
 
         // New schemas might contain only old columns. In this case last_column_id should not be
@@ -623,7 +672,7 @@ impl TableMetadataBuilder {
 
         self.last_added_schema_id = Some(new_schema_id);
 
-        self
+        Ok(self)
     }
 
     /// Set the current schema id.
@@ -651,10 +700,7 @@ impl TableMetadataBuilder {
         let _schema = self.metadata.schemas.get(&schema_id).ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
-                format!(
-                    "Cannot set current schema to unknown schema with id: '{}'",
-                    schema_id
-                ),
+                format!("Cannot set current schema to unknown schema with id: '{schema_id}'"),
             )
         })?;
 
@@ -679,7 +725,96 @@ impl TableMetadataBuilder {
 
     /// Add a schema and set it as the current schema.
     pub fn add_current_schema(self, schema: Schema) -> Result<Self> {
-        self.add_schema(schema).set_current_schema(Self::LAST_ADDED)
+        self.add_schema(schema)?
+            .set_current_schema(Self::LAST_ADDED)
+    }
+
+    /// Validate schema field names against partition field names across all historical schemas.
+    ///
+    /// Due to Iceberg's multi-version property, this check ignores existing schema fields
+    /// that match partition names (schema evolution allows re-adding previously removed fields).
+    /// Only NEW field names that conflict with partition names are rejected.
+    ///
+    /// # Errors
+    /// - Schema field name conflicts with partition field name but doesn't exist in any historical schema.
+    fn validate_schema_field_names(&self, schema: &Schema) -> Result<()> {
+        if self.metadata.schemas.is_empty() {
+            return Ok(());
+        }
+
+        for field_name in schema.field_id_to_name_map().values() {
+            let has_partition_conflict = self.metadata.partition_name_exists(field_name);
+            let is_new_field = !self.metadata.name_exists_in_any_schema(field_name);
+
+            if has_partition_conflict && is_new_field {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot add schema field '{field_name}' because it conflicts with existing partition field name. \
+                         Schema evolution cannot introduce field names that match existing partition field names."
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate partition field names against schema field names across all historical schemas.
+    ///
+    /// Due to Iceberg's multi-version property, partition fields can share names with schema fields
+    /// if they meet specific requirements (identity transform + matching source field ID).
+    /// This validation enforces those rules across all historical schema versions.
+    ///
+    /// # Errors
+    /// - Partition field name conflicts with schema field name but doesn't use identity transform.
+    /// - Partition field uses identity transform but references wrong source field ID.
+    fn validate_partition_field_names(&self, unbound_spec: &UnboundPartitionSpec) -> Result<()> {
+        if self.metadata.schemas.is_empty() {
+            return Ok(());
+        }
+
+        let current_schema = self.get_current_schema()?;
+        for partition_field in unbound_spec.fields() {
+            let exists_in_any_schema = self
+                .metadata
+                .name_exists_in_any_schema(&partition_field.name);
+
+            // Skip if partition field name doesn't conflict with any schema field
+            if !exists_in_any_schema {
+                continue;
+            }
+
+            // If name exists in schemas, validate against current schema rules
+            if let Some(schema_field) = current_schema.field_by_name(&partition_field.name) {
+                let is_identity_transform =
+                    partition_field.transform == crate::spec::Transform::Identity;
+                let has_matching_source_id = schema_field.id == partition_field.source_id;
+
+                if !is_identity_transform {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot create partition with name '{}' that conflicts with schema field and is not an identity transform.",
+                            partition_field.name
+                        ),
+                    ));
+                }
+
+                if !has_matching_source_id {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot create identity partition sourced from different field in schema. \
+                             Field name '{}' has id `{}` in schema but partition source id is `{}`",
+                            partition_field.name, schema_field.id, partition_field.source_id
+                        ),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Add a partition spec to the table metadata.
@@ -694,6 +829,10 @@ impl TableMetadataBuilder {
     /// - The partition spec has non-sequential field ids and the table format version is 1.
     pub fn add_partition_spec(mut self, unbound_spec: UnboundPartitionSpec) -> Result<Self> {
         let schema = self.get_current_schema()?.clone();
+
+        // Check if partition field names conflict with schema field names across all schemas
+        self.validate_partition_field_names(&unbound_spec)?;
+
         let spec = PartitionSpecBuilder::new_from_unbound(unbound_spec.clone(), schema)?
             .with_last_assigned_field_id(self.metadata.last_partition_id)
             .build()?;
@@ -922,6 +1061,31 @@ impl TableMetadataBuilder {
             .set_default_sort_order(Self::LAST_ADDED as i64)
     }
 
+    /// Add an encryption key to the table metadata.
+    pub fn add_encryption_key(mut self, key: EncryptedKey) -> Self {
+        let key_id = key.key_id().to_string();
+        if self.metadata.encryption_keys.contains_key(&key_id) {
+            // already exists
+            return self;
+        }
+
+        self.metadata.encryption_keys.insert(key_id, key.clone());
+        self.changes.push(TableUpdate::AddEncryptionKey {
+            encryption_key: key,
+        });
+        self
+    }
+
+    /// Remove an encryption key from the table metadata.
+    pub fn remove_encryption_key(mut self, key_id: &str) -> Self {
+        if self.metadata.encryption_keys.remove(key_id).is_some() {
+            self.changes.push(TableUpdate::RemoveEncryptionKey {
+                key_id: key_id.to_string(),
+            });
+        }
+        self
+    }
+
     /// Build the table metadata.
     pub fn build(mut self) -> Result<TableMetadataBuildResult> {
         self.metadata.last_updated_ms = self
@@ -964,9 +1128,9 @@ impl TableMetadataBuilder {
         let max_size = self
             .metadata
             .properties
-            .get(PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX)
+            .get(TableProperties::PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX)
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX_DEFAULT)
+            .unwrap_or(TableProperties::PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX_DEFAULT)
             .max(1);
 
         if self.metadata.metadata_log.len() > max_size {
@@ -1113,8 +1277,7 @@ impl TableMetadataBuilder {
                            Error::new(
                                ErrorKind::Unexpected,
                                format!(
-                                   "Cannot find source column with name {} for sort column in re-assigned schema.",
-                                   source_field_name
+                                   "Cannot find source column with name {source_field_name} for sort column in re-assigned schema."
                                ),
                            )
                        })?.id;
@@ -1263,8 +1426,8 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::{
         BlobMetadata, NestedField, NullOrder, Operation, PartitionSpec, PrimitiveType, Schema,
-        SnapshotRetention, SortDirection, SortField, StructType, Summary, Transform, Type,
-        UnboundPartitionField,
+        SnapshotRetention, SortDirection, SortField, StructType, Summary, TableProperties,
+        Transform, Type, UnboundPartitionField,
     };
     use crate::table::Table;
 
@@ -1859,6 +2022,7 @@ mod tests {
 
         let build_result = builder
             .add_schema(added_schema.clone())
+            .unwrap()
             .set_current_schema(1)
             .unwrap()
             .build()
@@ -2073,6 +2237,73 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_main_ref_keeps_snapshot_log() {
+        let builder = builder_without_changes(FormatVersion::V2);
+
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(1)
+            .with_timestamp_ms(builder.metadata.last_updated_ms + 1)
+            .with_sequence_number(0)
+            .with_schema_id(0)
+            .with_manifest_list("/snap-1.avro")
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::from_iter(vec![
+                    (
+                        "spark.app.id".to_string(),
+                        "local-1662532784305".to_string(),
+                    ),
+                    ("added-data-files".to_string(), "4".to_string()),
+                    ("added-records".to_string(), "4".to_string()),
+                    ("added-files-size".to_string(), "6001".to_string()),
+                ]),
+            })
+            .build();
+
+        let result = builder
+            .add_snapshot(snapshot.clone())
+            .unwrap()
+            .set_ref(MAIN_BRANCH, SnapshotReference {
+                snapshot_id: 1,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: Some(10),
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            })
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Verify snapshot log was created
+        assert_eq!(result.metadata.snapshot_log.len(), 1);
+        assert_eq!(result.metadata.snapshot_log[0].snapshot_id, 1);
+        assert_eq!(result.metadata.current_snapshot_id, Some(1));
+
+        // Remove the main ref
+        let result_after_remove = result
+            .metadata
+            .into_builder(Some(
+                "s3://bucket/test/location/metadata/metadata2.json".to_string(),
+            ))
+            .remove_ref(MAIN_BRANCH)
+            .build()
+            .unwrap();
+
+        // Verify snapshot log is kept even after removing main ref
+        assert_eq!(result_after_remove.metadata.snapshot_log.len(), 1);
+        assert_eq!(result_after_remove.metadata.snapshot_log[0].snapshot_id, 1);
+        assert_eq!(result_after_remove.metadata.current_snapshot_id, None);
+        assert_eq!(result_after_remove.changes.len(), 1);
+        assert_eq!(
+            result_after_remove.changes[0],
+            TableUpdate::RemoveSnapshotRef {
+                ref_name: MAIN_BRANCH.to_string()
+            }
+        );
+    }
+
+    #[test]
     fn test_set_branch_snapshot_creates_branch_if_not_exists() {
         let builder = builder_without_changes(FormatVersion::V2);
 
@@ -2201,7 +2432,7 @@ mod tests {
         let builder = builder_without_changes(FormatVersion::V2);
         let metadata = builder
             .set_properties(HashMap::from_iter(vec![(
-                PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX.to_string(),
+                TableProperties::PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX.to_string(),
                 "2".to_string(),
             )]))
             .unwrap()
@@ -2495,5 +2726,783 @@ mod tests {
                 unreachable!("Expected RemoveSchema change")
             };
         assert_eq!(remove_schema_ids, &[0]);
+    }
+
+    #[test]
+    fn test_schema_evolution_now_correctly_validates_partition_field_name_conflicts() {
+        let initial_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec_with_bucket = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(1, "bucket_data", Transform::Bucket(16))
+            .unwrap()
+            .build();
+
+        let metadata = TableMetadataBuilder::new(
+            initial_schema,
+            partition_spec_with_bucket,
+            SortOrder::unsorted_order(),
+            TEST_LOCATION.to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        let partition_field_names: Vec<String> = metadata
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert!(partition_field_names.contains(&"bucket_data".to_string()));
+
+        let evolved_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+                // Adding a schema field with the same name as an existing partition field
+                NestedField::required(2, "bucket_data", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let builder = metadata.into_builder(Some(
+            "s3://bucket/test/location/metadata/metadata1.json".to_string(),
+        ));
+
+        // Try to add the evolved schema - this should now fail immediately with a clear error
+        let result = builder.add_current_schema(evolved_schema);
+
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        let error_message = error.message();
+        assert!(error_message.contains("Cannot add schema field 'bucket_data' because it conflicts with existing partition field name"));
+        assert!(error_message.contains("Schema evolution cannot introduce field names that match existing partition field names"));
+    }
+
+    #[test]
+    fn test_schema_evolution_should_validate_on_schema_add_not_metadata_build() {
+        let initial_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(1, "partition_col", Transform::Bucket(16))
+            .unwrap()
+            .build();
+
+        let metadata = TableMetadataBuilder::new(
+            initial_schema,
+            partition_spec,
+            SortOrder::unsorted_order(),
+            TEST_LOCATION.to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        let non_conflicting_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(2, "new_field", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        // This should succeed since there's no name conflict
+        let result = metadata
+            .clone()
+            .into_builder(Some("test_location".to_string()))
+            .add_current_schema(non_conflicting_schema)
+            .unwrap()
+            .build();
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_partition_spec_evolution_validates_schema_field_name_conflicts() {
+        let initial_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(2, "existing_field", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(1, "data_bucket", Transform::Bucket(16))
+            .unwrap()
+            .build();
+
+        let metadata = TableMetadataBuilder::new(
+            initial_schema,
+            partition_spec,
+            SortOrder::unsorted_order(),
+            TEST_LOCATION.to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        let builder = metadata.into_builder(Some(
+            "s3://bucket/test/location/metadata/metadata1.json".to_string(),
+        ));
+
+        let conflicting_partition_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(1)
+            .add_partition_field(1, "existing_field", Transform::Bucket(8))
+            .unwrap()
+            .build();
+
+        let result = builder.add_partition_spec(conflicting_partition_spec);
+
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        let error_message = error.message();
+        // The error comes from our multi-version validation
+        assert!(error_message.contains(
+            "Cannot create partition with name 'existing_field' that conflicts with schema field"
+        ));
+        assert!(error_message.contains("and is not an identity transform"));
+    }
+
+    #[test]
+    fn test_schema_evolution_validates_against_all_historical_schemas() {
+        // Create a table with an initial schema that has a field "existing_field"
+        let initial_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(2, "existing_field", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(1, "bucket_data", Transform::Bucket(16))
+            .unwrap()
+            .build();
+
+        let metadata = TableMetadataBuilder::new(
+            initial_schema,
+            partition_spec,
+            SortOrder::unsorted_order(),
+            TEST_LOCATION.to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        // Add a second schema that removes the existing_field but keeps the data field
+        let second_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(3, "new_field", Type::Primitive(PrimitiveType::String))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let metadata = metadata
+            .into_builder(Some("test_location".to_string()))
+            .add_current_schema(second_schema)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        // Now try to add a third schema that reintroduces "existing_field"
+        // This should succeed because "existing_field" exists in a historical schema,
+        // even though there's a partition field named "bucket_data"
+        let third_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(3, "new_field", Type::Primitive(PrimitiveType::String))
+                    .into(),
+                NestedField::required(4, "existing_field", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let builder = metadata
+            .clone()
+            .into_builder(Some("test_location".to_string()));
+
+        // This should succeed because "existing_field" exists in a historical schema
+        let result = builder.add_current_schema(third_schema);
+        assert!(result.is_ok());
+
+        // However, trying to add a schema field that conflicts with the partition field
+        // and doesn't exist in any historical schema should fail
+        let conflicting_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(3, "new_field", Type::Primitive(PrimitiveType::String))
+                    .into(),
+                NestedField::required(4, "existing_field", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(5, "bucket_data", Type::Primitive(PrimitiveType::String))
+                    .into(), // conflicts with partition field
+            ])
+            .build()
+            .unwrap();
+
+        let builder2 = metadata.into_builder(Some("test_location".to_string()));
+        let result2 = builder2.add_current_schema(conflicting_schema);
+
+        // This should fail because "bucket_data" conflicts with partition field name
+        // and doesn't exist in any historical schema
+        assert!(result2.is_err());
+        let error = result2.unwrap_err();
+        assert!(error.message().contains("Cannot add schema field 'bucket_data' because it conflicts with existing partition field name"));
+    }
+
+    #[test]
+    fn test_schema_evolution_allows_existing_partition_field_if_exists_in_historical_schema() {
+        // Create initial schema with a field
+        let initial_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(2, "partition_data", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(2, "partition_data", Transform::Identity)
+            .unwrap()
+            .build();
+
+        let metadata = TableMetadataBuilder::new(
+            initial_schema,
+            partition_spec,
+            SortOrder::unsorted_order(),
+            TEST_LOCATION.to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        // Add a new schema that still contains the partition_data field
+        let evolved_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(2, "partition_data", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(3, "new_field", Type::Primitive(PrimitiveType::String))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+
+        // This should succeed because partition_data exists in historical schemas
+        let result = metadata
+            .into_builder(Some("test_location".to_string()))
+            .add_current_schema(evolved_schema);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_schema_evolution_prevents_new_field_conflicting_with_partition_field() {
+        // Create initial schema WITHOUT the conflicting field
+        let initial_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(1, "bucket_data", Transform::Bucket(16))
+            .unwrap()
+            .build();
+
+        let metadata = TableMetadataBuilder::new(
+            initial_schema,
+            partition_spec,
+            SortOrder::unsorted_order(),
+            TEST_LOCATION.to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        // Try to add a schema with a field that conflicts with partition field name
+        let conflicting_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+                // This field name conflicts with the partition field "bucket_data"
+                NestedField::required(2, "bucket_data", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let builder = metadata.into_builder(Some("test_location".to_string()));
+        let result = builder.add_current_schema(conflicting_schema);
+
+        // This should fail because "bucket_data" conflicts with partition field name
+        // and doesn't exist in any historical schema
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.message().contains("Cannot add schema field 'bucket_data' because it conflicts with existing partition field name"));
+    }
+
+    #[test]
+    fn test_partition_spec_evolution_allows_non_conflicting_names() {
+        let initial_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(2, "existing_field", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(1, "data_bucket", Transform::Bucket(16))
+            .unwrap()
+            .build();
+
+        let metadata = TableMetadataBuilder::new(
+            initial_schema,
+            partition_spec,
+            SortOrder::unsorted_order(),
+            TEST_LOCATION.to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        let builder = metadata.into_builder(Some(
+            "s3://bucket/test/location/metadata/metadata1.json".to_string(),
+        ));
+
+        // Try to add a partition spec with a field name that does NOT conflict with existing schema fields
+        let non_conflicting_partition_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(1)
+            .add_partition_field(2, "new_partition_field", Transform::Bucket(8))
+            .unwrap()
+            .build();
+
+        let result = builder.add_partition_spec(non_conflicting_partition_spec);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_row_lineage_addition() {
+        let new_rows = 30;
+        let base = builder_without_changes(FormatVersion::V3)
+            .build()
+            .unwrap()
+            .metadata;
+        let add_rows = Snapshot::builder()
+            .with_snapshot_id(0)
+            .with_timestamp_ms(base.last_updated_ms + 1)
+            .with_sequence_number(0)
+            .with_schema_id(0)
+            .with_manifest_list("foo")
+            .with_parent_snapshot_id(None)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_row_range(base.next_row_id(), new_rows)
+            .build();
+
+        let first_addition = base
+            .into_builder(None)
+            .add_snapshot(add_rows.clone())
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        assert_eq!(first_addition.next_row_id(), new_rows);
+
+        let add_more_rows = Snapshot::builder()
+            .with_snapshot_id(1)
+            .with_timestamp_ms(first_addition.last_updated_ms + 1)
+            .with_sequence_number(1)
+            .with_schema_id(0)
+            .with_manifest_list("foo")
+            .with_parent_snapshot_id(Some(0))
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_row_range(first_addition.next_row_id(), new_rows)
+            .build();
+
+        let second_addition = first_addition
+            .into_builder(None)
+            .add_snapshot(add_more_rows)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(second_addition.next_row_id(), new_rows * 2);
+    }
+
+    #[test]
+    fn test_row_lineage_invalid_snapshot() {
+        let new_rows = 30;
+        let base = builder_without_changes(FormatVersion::V3)
+            .build()
+            .unwrap()
+            .metadata;
+
+        // add rows to check TableMetadata validation; Snapshot rejects negative next-row-id
+        let add_rows = Snapshot::builder()
+            .with_snapshot_id(0)
+            .with_timestamp_ms(base.last_updated_ms + 1)
+            .with_sequence_number(0)
+            .with_schema_id(0)
+            .with_manifest_list("foo")
+            .with_parent_snapshot_id(None)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_row_range(base.next_row_id(), new_rows)
+            .build();
+
+        let added = base
+            .into_builder(None)
+            .add_snapshot(add_rows)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        let invalid_new_rows = Snapshot::builder()
+            .with_snapshot_id(1)
+            .with_timestamp_ms(added.last_updated_ms + 1)
+            .with_sequence_number(1)
+            .with_schema_id(0)
+            .with_manifest_list("foo")
+            .with_parent_snapshot_id(Some(0))
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            // first_row_id is behind table next_row_id
+            .with_row_range(added.next_row_id() - 1, 10)
+            .build();
+
+        let err = added
+            .into_builder(None)
+            .add_snapshot(invalid_new_rows)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "Cannot add a snapshot, first-row-id is behind table next-row-id: 29 < 30"
+            )
+        );
+    }
+
+    #[test]
+    fn test_row_lineage_append_branch() {
+        // Appends to a branch should still change last-row-id even if not on main, these changes
+        // should also affect commits to main
+
+        let branch = "some_branch";
+
+        // Start with V3 metadata to support row lineage
+        let base = builder_without_changes(FormatVersion::V3)
+            .build()
+            .unwrap()
+            .metadata;
+
+        // Initial next_row_id should be 0
+        assert_eq!(base.next_row_id(), 0);
+
+        // Write to Branch - append 30 rows
+        let branch_snapshot_1 = Snapshot::builder()
+            .with_snapshot_id(1)
+            .with_timestamp_ms(base.last_updated_ms + 1)
+            .with_sequence_number(0)
+            .with_schema_id(0)
+            .with_manifest_list("foo")
+            .with_parent_snapshot_id(None)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_row_range(base.next_row_id(), 30)
+            .build();
+
+        let table_after_branch_1 = base
+            .into_builder(None)
+            .set_branch_snapshot(branch_snapshot_1.clone(), branch)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        // Current snapshot should be null (no main branch snapshot yet)
+        assert!(table_after_branch_1.current_snapshot().is_none());
+
+        // Branch snapshot should have first_row_id = 0
+        let branch_ref = table_after_branch_1.refs.get(branch).unwrap();
+        let branch_snap_1 = table_after_branch_1
+            .snapshots
+            .get(&branch_ref.snapshot_id)
+            .unwrap();
+        assert_eq!(branch_snap_1.first_row_id(), Some(0));
+
+        // Next row id should be 30
+        assert_eq!(table_after_branch_1.next_row_id(), 30);
+
+        // Write to Main - append 28 rows
+        let main_snapshot = Snapshot::builder()
+            .with_snapshot_id(2)
+            .with_timestamp_ms(table_after_branch_1.last_updated_ms + 1)
+            .with_sequence_number(1)
+            .with_schema_id(0)
+            .with_manifest_list("bar")
+            .with_parent_snapshot_id(None)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_row_range(table_after_branch_1.next_row_id(), 28)
+            .build();
+
+        let table_after_main = table_after_branch_1
+            .into_builder(None)
+            .add_snapshot(main_snapshot.clone())
+            .unwrap()
+            .set_ref(MAIN_BRANCH, SnapshotReference {
+                snapshot_id: main_snapshot.snapshot_id(),
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            })
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        // Main snapshot should have first_row_id = 30
+        let current_snapshot = table_after_main.current_snapshot().unwrap();
+        assert_eq!(current_snapshot.first_row_id(), Some(30));
+
+        // Next row id should be 58 (30 + 28)
+        assert_eq!(table_after_main.next_row_id(), 58);
+
+        // Write again to branch - append 21 rows
+        let branch_snapshot_2 = Snapshot::builder()
+            .with_snapshot_id(3)
+            .with_timestamp_ms(table_after_main.last_updated_ms + 1)
+            .with_sequence_number(2)
+            .with_schema_id(0)
+            .with_manifest_list("baz")
+            .with_parent_snapshot_id(Some(branch_snapshot_1.snapshot_id()))
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_row_range(table_after_main.next_row_id(), 21)
+            .build();
+
+        let table_after_branch_2 = table_after_main
+            .into_builder(None)
+            .set_branch_snapshot(branch_snapshot_2.clone(), branch)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        // Branch snapshot should have first_row_id = 58 (30 + 28)
+        let branch_ref_2 = table_after_branch_2.refs.get(branch).unwrap();
+        let branch_snap_2 = table_after_branch_2
+            .snapshots
+            .get(&branch_ref_2.snapshot_id)
+            .unwrap();
+        assert_eq!(branch_snap_2.first_row_id(), Some(58));
+
+        // Next row id should be 79 (30 + 28 + 21)
+        assert_eq!(table_after_branch_2.next_row_id(), 79);
+    }
+
+    #[test]
+    fn test_encryption_keys() {
+        let builder = builder_without_changes(FormatVersion::V2);
+
+        // Create test encryption keys
+        let encryption_key_1 = EncryptedKey::builder()
+            .key_id("key-1")
+            .encrypted_key_metadata(vec![1, 2, 3, 4])
+            .encrypted_by_id("encryption-service-1")
+            .properties(HashMap::from_iter(vec![(
+                "algorithm".to_string(),
+                "AES-256".to_string(),
+            )]))
+            .build();
+
+        let encryption_key_2 = EncryptedKey::builder()
+            .key_id("key-2")
+            .encrypted_key_metadata(vec![5, 6, 7, 8])
+            .encrypted_by_id("encryption-service-2")
+            .properties(HashMap::new())
+            .build();
+
+        // Add first encryption key
+        let build_result = builder
+            .add_encryption_key(encryption_key_1.clone())
+            .build()
+            .unwrap();
+
+        assert_eq!(build_result.changes.len(), 1);
+        assert_eq!(build_result.metadata.encryption_keys.len(), 1);
+        assert_eq!(
+            build_result.metadata.encryption_key("key-1"),
+            Some(&encryption_key_1)
+        );
+        assert_eq!(build_result.changes[0], TableUpdate::AddEncryptionKey {
+            encryption_key: encryption_key_1.clone()
+        });
+
+        // Add second encryption key
+        let build_result = build_result
+            .metadata
+            .into_builder(Some(
+                "s3://bucket/test/location/metadata/metadata1.json".to_string(),
+            ))
+            .add_encryption_key(encryption_key_2.clone())
+            .build()
+            .unwrap();
+
+        assert_eq!(build_result.changes.len(), 1);
+        assert_eq!(build_result.metadata.encryption_keys.len(), 2);
+        assert_eq!(
+            build_result.metadata.encryption_key("key-1"),
+            Some(&encryption_key_1)
+        );
+        assert_eq!(
+            build_result.metadata.encryption_key("key-2"),
+            Some(&encryption_key_2)
+        );
+        assert_eq!(build_result.changes[0], TableUpdate::AddEncryptionKey {
+            encryption_key: encryption_key_2.clone()
+        });
+
+        // Try to add duplicate key - should not create a change
+        let build_result = build_result
+            .metadata
+            .into_builder(Some(
+                "s3://bucket/test/location/metadata/metadata2.json".to_string(),
+            ))
+            .add_encryption_key(encryption_key_1.clone())
+            .build()
+            .unwrap();
+
+        assert_eq!(build_result.changes.len(), 0);
+        assert_eq!(build_result.metadata.encryption_keys.len(), 2);
+
+        // Remove first encryption key
+        let build_result = build_result
+            .metadata
+            .into_builder(Some(
+                "s3://bucket/test/location/metadata/metadata3.json".to_string(),
+            ))
+            .remove_encryption_key("key-1")
+            .build()
+            .unwrap();
+
+        assert_eq!(build_result.changes.len(), 1);
+        assert_eq!(build_result.metadata.encryption_keys.len(), 1);
+        assert_eq!(build_result.metadata.encryption_key("key-1"), None);
+        assert_eq!(
+            build_result.metadata.encryption_key("key-2"),
+            Some(&encryption_key_2)
+        );
+        assert_eq!(build_result.changes[0], TableUpdate::RemoveEncryptionKey {
+            key_id: "key-1".to_string()
+        });
+
+        // Try to remove non-existent key - should not create a change
+        let build_result = build_result
+            .metadata
+            .into_builder(Some(
+                "s3://bucket/test/location/metadata/metadata4.json".to_string(),
+            ))
+            .remove_encryption_key("non-existent-key")
+            .build()
+            .unwrap();
+
+        assert_eq!(build_result.changes.len(), 0);
+        assert_eq!(build_result.metadata.encryption_keys.len(), 1);
+
+        // Test encryption_keys_iter()
+        let keys = build_result
+            .metadata
+            .encryption_keys_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], &encryption_key_2);
+
+        // Remove last encryption key
+        let build_result = build_result
+            .metadata
+            .into_builder(Some(
+                "s3://bucket/test/location/metadata/metadata5.json".to_string(),
+            ))
+            .remove_encryption_key("key-2")
+            .build()
+            .unwrap();
+
+        assert_eq!(build_result.changes.len(), 1);
+        assert_eq!(build_result.metadata.encryption_keys.len(), 0);
+        assert_eq!(build_result.metadata.encryption_key("key-2"), None);
+        assert_eq!(build_result.changes[0], TableUpdate::RemoveEncryptionKey {
+            key_id: "key-2".to_string()
+        });
+
+        // Verify empty encryption_keys_iter()
+        let keys = build_result.metadata.encryption_keys_iter();
+        assert_eq!(keys.len(), 0);
     }
 }

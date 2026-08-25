@@ -45,7 +45,8 @@ pub(crate) struct ManifestFileContext {
     object_cache: Arc<ObjectCache>,
     snapshot_schema: SchemaRef,
     expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
-    delete_file_index: Option<DeleteFileIndex>,
+    delete_file_index: DeleteFileIndex,
+    case_sensitive: bool,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -58,7 +59,8 @@ pub(crate) struct ManifestEntryContext {
     pub bound_predicates: Option<Arc<BoundPredicates>>,
     pub partition_spec_id: i32,
     pub snapshot_schema: SchemaRef,
-    pub delete_file_index: Option<DeleteFileIndex>,
+    pub delete_file_index: DeleteFileIndex,
+    pub case_sensitive: bool,
 }
 
 impl ManifestFileContext {
@@ -89,6 +91,7 @@ impl ManifestFileContext {
                 bound_predicates: bound_predicates.clone(),
                 snapshot_schema: snapshot_schema.clone(),
                 delete_file_index: delete_file_index.clone(),
+                case_sensitive: self.case_sensitive,
             };
 
             sender
@@ -105,16 +108,13 @@ impl ManifestEntryContext {
     /// consume this `ManifestEntryContext`, returning a `FileScanTask`
     /// created from it
     pub(crate) async fn into_file_scan_task(self) -> Result<FileScanTask> {
-        let deletes = if let Some(delete_file_index) = self.delete_file_index {
-            delete_file_index
-                .get_deletes_for_data_file(
-                    self.manifest_entry.data_file(),
-                    self.manifest_entry.sequence_number(),
-                )
-                .await?
-        } else {
-            vec![]
-        };
+        let deletes = self
+            .delete_file_index
+            .get_deletes_for_data_file(
+                self.manifest_entry.data_file(),
+                self.manifest_entry.sequence_number(),
+            )
+            .await;
 
         Ok(FileScanTask {
             start: 0,
@@ -122,7 +122,6 @@ impl ManifestEntryContext {
             record_count: Some(self.manifest_entry.record_count()),
 
             data_file_path: self.manifest_entry.file_path().to_string(),
-            data_file_content: self.manifest_entry.content_type(),
             data_file_format: self.manifest_entry.file_format(),
 
             schema: self.snapshot_schema,
@@ -132,6 +131,14 @@ impl ManifestEntryContext {
                 .map(|x| x.as_ref().snapshot_bound_predicate.clone()),
 
             deletes,
+
+            // Include partition data and spec from manifest entry
+            partition: Some(self.manifest_entry.data_file.partition.clone()),
+            // TODO: Pass actual PartitionSpec through context chain for native flow
+            partition_spec: None,
+            // TODO: Extract name_mapping from table metadata property "schema.name-mapping.default"
+            name_mapping: None,
+            case_sensitive: self.case_sensitive,
         })
     }
 }
@@ -188,24 +195,28 @@ impl PlanContext {
         &self,
         manifest_list: Arc<ManifestList>,
         tx_data: Sender<ManifestEntryContext>,
-        delete_file_idx_and_tx: Option<(DeleteFileIndex, Sender<ManifestEntryContext>)>,
+        delete_file_idx: DeleteFileIndex,
+        delete_file_tx: Sender<ManifestEntryContext>,
     ) -> Result<Box<impl Iterator<Item = Result<ManifestFileContext>> + 'static>> {
-        let manifest_files = manifest_list.entries().iter();
+        let mut manifest_files = manifest_list.entries().iter().collect::<Vec<_>>();
+        // Sort manifest files to process delete manifests first.
+        // This avoids a deadlock where the producer blocks on sending data manifest entries
+        // (because the data channel is full) while the delete manifest consumer is waiting
+        // for delete manifest entries (which haven't been produced yet).
+        // By processing delete manifests first, we ensure the delete consumer can finish,
+        // which then allows the data consumer to start draining the data channel.
+        manifest_files.sort_by_key(|m| match m.content {
+            ManifestContentType::Deletes => 0,
+            ManifestContentType::Data => 1,
+        });
 
         // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
         let mut filtered_mfcs = vec![];
-
         for manifest_file in manifest_files {
-            let (delete_file_idx, tx) = if manifest_file.content == ManifestContentType::Deletes {
-                let Some((delete_file_idx, tx)) = delete_file_idx_and_tx.as_ref() else {
-                    continue;
-                };
-                (Some(delete_file_idx.clone()), tx.clone())
+            let tx = if manifest_file.content == ManifestContentType::Deletes {
+                delete_file_tx.clone()
             } else {
-                (
-                    delete_file_idx_and_tx.as_ref().map(|x| x.0.clone()),
-                    tx_data.clone(),
-                )
+                tx_data.clone()
             };
 
             let partition_bound_predicate = if self.predicate.is_some() {
@@ -233,7 +244,7 @@ impl PlanContext {
                 manifest_file,
                 partition_bound_predicate,
                 tx,
-                delete_file_idx,
+                delete_file_idx.clone(),
             );
 
             filtered_mfcs.push(Ok(mfc));
@@ -247,7 +258,7 @@ impl PlanContext {
         manifest_file: &ManifestFile,
         partition_filter: Option<Arc<BoundPredicate>>,
         sender: Sender<ManifestEntryContext>,
-        delete_file_index: Option<DeleteFileIndex>,
+        delete_file_index: DeleteFileIndex,
     ) -> ManifestFileContext {
         let bound_predicates =
             if let (Some(ref partition_bound_predicate), Some(snapshot_bound_predicate)) =
@@ -270,6 +281,7 @@ impl PlanContext {
             field_ids: self.field_ids.clone(),
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
             delete_file_index,
+            case_sensitive: self.case_sensitive,
         }
     }
 }

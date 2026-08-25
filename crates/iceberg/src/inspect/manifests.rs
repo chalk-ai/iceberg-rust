@@ -29,7 +29,7 @@ use futures::{StreamExt, stream};
 use crate::Result;
 use crate::arrow::schema_to_arrow_schema;
 use crate::scan::ArrowRecordBatchStream;
-use crate::spec::{FieldSummary, ListType, NestedField, PrimitiveType, StructType, Type};
+use crate::spec::{Datum, FieldSummary, ListType, NestedField, PrimitiveType, StructType, Type};
 use crate::table::Table;
 
 /// Manifests table.
@@ -181,7 +181,20 @@ impl<'a> ManifestsTable<'a> {
                     .append_value(manifest.existing_files_count.unwrap_or(0) as i32);
                 deleted_delete_files_count
                     .append_value(manifest.deleted_files_count.unwrap_or(0) as i32);
-                self.append_partition_summaries(&mut partition_summaries, &manifest.partitions);
+
+                let spec = self
+                    .table
+                    .metadata()
+                    .partition_spec_by_id(manifest.partition_spec_id)
+                    .unwrap();
+                let spec_struct = spec
+                    .partition_type(self.table.metadata().current_schema())
+                    .unwrap();
+                self.append_partition_summaries(
+                    &mut partition_summaries,
+                    &manifest.partitions.clone().unwrap_or_else(Vec::new),
+                    spec_struct,
+                );
             }
         }
 
@@ -230,9 +243,10 @@ impl<'a> ManifestsTable<'a> {
         &self,
         builder: &mut GenericListBuilder<i32, StructBuilder>,
         partitions: &[FieldSummary],
+        partition_struct: StructType,
     ) {
         let partition_summaries_builder = builder.values();
-        for summary in partitions {
+        for (summary, field) in partitions.iter().zip(partition_struct.fields()) {
             partition_summaries_builder
                 .field_builder::<BooleanBuilder>(0)
                 .unwrap()
@@ -241,14 +255,23 @@ impl<'a> ManifestsTable<'a> {
                 .field_builder::<BooleanBuilder>(1)
                 .unwrap()
                 .append_option(summary.contains_nan);
+
             partition_summaries_builder
                 .field_builder::<StringBuilder>(2)
                 .unwrap()
-                .append_option(summary.lower_bound.as_ref().map(|v| v.to_string()));
+                .append_option(summary.lower_bound.as_ref().map(|v| {
+                    Datum::try_from_bytes(v, field.field_type.as_primitive_type().unwrap().clone())
+                        .unwrap()
+                        .to_string()
+                }));
             partition_summaries_builder
                 .field_builder::<StringBuilder>(3)
                 .unwrap()
-                .append_option(summary.upper_bound.as_ref().map(|v| v.to_string()));
+                .append_option(summary.upper_bound.as_ref().map(|v| {
+                    Datum::try_from_bytes(v, field.field_type.as_primitive_type().unwrap().clone())
+                        .unwrap()
+                        .to_string()
+                }));
             partition_summaries_builder.append(true);
         }
         builder.append(true);
@@ -258,9 +281,10 @@ impl<'a> ManifestsTable<'a> {
 #[cfg(test)]
 mod tests {
     use expect_test::expect;
+    use futures::TryStreamExt;
 
-    use crate::inspect::metadata_table::tests::check_record_batches;
     use crate::scan::tests::TableTestFixture;
+    use crate::test_utils::check_record_batches;
 
     #[tokio::test]
     async fn test_manifests_table() {
@@ -270,20 +294,20 @@ mod tests {
         let record_batch = fixture.table.inspect().manifests().scan().await.unwrap();
 
         check_record_batches(
-            record_batch,
+            record_batch.try_collect::<Vec<_>>().await.unwrap(),
             expect![[r#"
-                Field { name: "content", data_type: Int32, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "14"} },
-                Field { name: "path", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "1"} },
-                Field { name: "length", data_type: Int64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "2"} },
-                Field { name: "partition_spec_id", data_type: Int32, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "3"} },
-                Field { name: "added_snapshot_id", data_type: Int64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "4"} },
-                Field { name: "added_data_files_count", data_type: Int32, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "5"} },
-                Field { name: "existing_data_files_count", data_type: Int32, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "6"} },
-                Field { name: "deleted_data_files_count", data_type: Int32, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "7"} },
-                Field { name: "added_delete_files_count", data_type: Int32, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "15"} },
-                Field { name: "existing_delete_files_count", data_type: Int32, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "16"} },
-                Field { name: "deleted_delete_files_count", data_type: Int32, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "17"} },
-                Field { name: "partition_summaries", data_type: List(Field { name: "item", data_type: Struct([Field { name: "contains_null", data_type: Boolean, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "10"} }, Field { name: "contains_nan", data_type: Boolean, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "11"} }, Field { name: "lower_bound", data_type: Utf8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "12"} }, Field { name: "upper_bound", data_type: Utf8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "13"} }]), nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "9"} }), nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "8"} }"#]],
+                Field { "content": Int32, metadata: {"PARQUET:field_id": "14"} },
+                Field { "path": Utf8, metadata: {"PARQUET:field_id": "1"} },
+                Field { "length": Int64, metadata: {"PARQUET:field_id": "2"} },
+                Field { "partition_spec_id": Int32, metadata: {"PARQUET:field_id": "3"} },
+                Field { "added_snapshot_id": Int64, metadata: {"PARQUET:field_id": "4"} },
+                Field { "added_data_files_count": Int32, metadata: {"PARQUET:field_id": "5"} },
+                Field { "existing_data_files_count": Int32, metadata: {"PARQUET:field_id": "6"} },
+                Field { "deleted_data_files_count": Int32, metadata: {"PARQUET:field_id": "7"} },
+                Field { "added_delete_files_count": Int32, metadata: {"PARQUET:field_id": "15"} },
+                Field { "existing_delete_files_count": Int32, metadata: {"PARQUET:field_id": "16"} },
+                Field { "deleted_delete_files_count": Int32, metadata: {"PARQUET:field_id": "17"} },
+                Field { "partition_summaries": List(non-null Struct("contains_null": non-null Boolean, metadata: {"PARQUET:field_id": "10"}, "contains_nan": Boolean, metadata: {"PARQUET:field_id": "11"}, "lower_bound": Utf8, metadata: {"PARQUET:field_id": "12"}, "upper_bound": Utf8, metadata: {"PARQUET:field_id": "13"}), metadata: {"PARQUET:field_id": "9"}), metadata: {"PARQUET:field_id": "8"} }"#]],
             expect![[r#"
                 content: PrimitiveArray<Int32>
                 [
@@ -355,6 +379,6 @@ mod tests {
                 ]"#]],
             &["path", "length"],
             Some("path"),
-        ).await;
+        );
     }
 }

@@ -1,0 +1,50 @@
+steps:
+  - group: "Rust CI"
+    steps:
+      - label: ":rust: fmt"
+        command: "bash .buildkite/ci.sh fmt"
+
+      - label: ":rust: toml"
+        command: "bash .buildkite/ci.sh toml"
+
+      - label: ":rust: clippy"
+        command: "bash .buildkite/ci.sh clippy"
+
+      - label: ":rust: build"
+        command: "bash .buildkite/ci.sh build"
+
+      - label: ":rust: no default features"
+        command: "bash .buildkite/ci.sh no-default-features"
+
+      - label: ":rust: tests"
+        command: "bash .buildkite/ci.sh test"
+
+      - label: ":rust: doc tests"
+        command: "bash .buildkite/ci.sh doc-test"
+
+      - label: ":iceberg: chalk consumer crates"
+        command: "bash .buildkite/ci.sh chalk-consumer"
+
+      - label: ":docker: integration tests"
+        command: "bash .buildkite/ci.sh docker-integration-test"
+        soft_fail:
+          - exit_status: "*"
+
+  - group: "Repository hygiene"
+    steps:
+      - label: ":mag: cargo machete"
+        command: "bash .buildkite/ci.sh cargo-machete"
+
+      - label: ":shield: cargo audit"
+        command: "bash .buildkite/ci.sh audit"
+        soft_fail:
+          - exit_status: "*"
+
+      - label: ":memo: typos"
+        command: "bash .buildkite/ci.sh typos"
+
+  - wait
+
+  - label: ":label: release"
+    command: "bash .buildkite/release.sh"
+    if: build.tag =~ /^chalk-v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$/

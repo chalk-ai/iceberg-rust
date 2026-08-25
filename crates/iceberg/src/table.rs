@@ -24,7 +24,7 @@ use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::scan::TableScanBuilder;
-use crate::spec::{TableMetadata, TableMetadataRef};
+use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
 use crate::{Error, ErrorKind, Result, TableIdent};
 
 /// Builder to create table scan.
@@ -162,8 +162,16 @@ pub struct Table {
 }
 
 impl Table {
-    pub(crate) fn with_metadata(&mut self, metadata: TableMetadataRef) {
+    /// Sets the [`Table`] metadata and returns an updated instance with the new metadata applied.
+    pub(crate) fn with_metadata(mut self, metadata: TableMetadataRef) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Sets the [`Table`] metadata location and returns an updated instance.
+    pub(crate) fn with_metadata_location(mut self, metadata_location: String) -> Self {
+        self.metadata_location = Some(metadata_location);
+        self
     }
 
     /// Returns a TableBuilder to build a table
@@ -190,6 +198,17 @@ impl Table {
         self.metadata_location.as_deref()
     }
 
+    /// Returns current metadata location in a result.
+    pub fn metadata_location_result(&self) -> Result<&str> {
+        self.metadata_location.as_deref().ok_or(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Metadata location does not exist for table: {}",
+                self.identifier
+            ),
+        ))
+    }
+
     /// Returns file io used in this table.
     pub fn file_io(&self) -> &FileIO {
         &self.file_io
@@ -214,6 +233,11 @@ impl Table {
     /// Returns the flag indicating whether the `Table` is readonly or not
     pub fn readonly(&self) -> bool {
         self.readonly
+    }
+
+    /// Returns the current schema as a shared reference.
+    pub fn current_schema_ref(&self) -> SchemaRef {
+        self.metadata.current_schema().clone()
     }
 
     /// Create a reader for the table.
@@ -269,14 +293,21 @@ impl StaticTable {
     }
     /// Creates a static table directly from metadata file and `FileIO`
     pub async fn from_metadata_file(
-        metadata_file_path: &str,
+        metadata_location: &str,
         table_ident: TableIdent,
         file_io: FileIO,
     ) -> Result<Self> {
-        let metadata_file = file_io.new_input(metadata_file_path)?;
-        let metadata_file_content = metadata_file.read().await?;
-        let table_metadata = serde_json::from_slice::<TableMetadata>(&metadata_file_content)?;
-        Self::from_metadata(table_metadata, table_ident, file_io).await
+        let metadata = TableMetadata::read_from(&file_io, metadata_location).await?;
+
+        let table = Table::builder()
+            .metadata(metadata)
+            .metadata_location(metadata_location)
+            .identifier(table_ident)
+            .file_io(file_io.clone())
+            .readonly(true)
+            .build();
+
+        Ok(Self(table?))
     }
 
     /// Create a TableScanBuilder for the static table.
@@ -354,6 +385,10 @@ mod tests {
         let table = static_table.into_table();
         assert!(table.readonly());
         assert_eq!(table.identifier.name(), "static_table");
+        assert_eq!(
+            table.metadata_location(),
+            Some(metadata_file_path).as_deref()
+        );
     }
 
     #[tokio::test]

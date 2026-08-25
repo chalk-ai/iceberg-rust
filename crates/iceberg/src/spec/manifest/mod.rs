@@ -34,6 +34,7 @@ use super::{
     UNASSIGNED_SEQUENCE_NUMBER,
 };
 use crate::error::Result;
+use crate::{Error, ErrorKind};
 
 /// A manifest contains metadata and a list of entries.
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -69,7 +70,8 @@ impl Manifest {
                     })
                     .collect::<Result<Vec<_>>>()?
             }
-            FormatVersion::V2 => {
+            // Manifest Schema & Manifest Entry did not change between V2 and V3
+            FormatVersion::V2 | FormatVersion::V3 => {
                 let schema = manifest_schema_v2(&partition_type)?;
                 let reader = AvroReader::with_schema(&schema, bs)?;
                 reader
@@ -99,6 +101,11 @@ impl Manifest {
         &self.entries
     }
 
+    /// Get metadata.
+    pub fn metadata(&self) -> &ManifestMetadata {
+        &self.metadata
+    }
+
     /// Consume this Manifest, returning its constituent parts
     pub fn into_parts(self) -> (Vec<ManifestEntryRef>, ManifestMetadata) {
         let Self { entries, metadata } = self;
@@ -114,12 +121,47 @@ impl Manifest {
     }
 }
 
+/// Serialize a DataFile to a JSON string.
+pub fn serialize_data_file_to_json(
+    data_file: DataFile,
+    partition_type: &super::StructType,
+    format_version: FormatVersion,
+) -> Result<String> {
+    let serde = _serde::DataFileSerde::try_from(data_file, partition_type, format_version)?;
+    serde_json::to_string(&serde).map_err(|e| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "Failed to serialize DataFile to JSON!".to_string(),
+        )
+        .with_source(e)
+    })
+}
+
+/// Deserialize a DataFile from a JSON string.
+pub fn deserialize_data_file_from_json(
+    json: &str,
+    partition_spec_id: i32,
+    partition_type: &super::StructType,
+    schema: &Schema,
+) -> Result<DataFile> {
+    let serde = serde_json::from_str::<_serde::DataFileSerde>(json).map_err(|e| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "Failed to deserialize JSON to DataFile!".to_string(),
+        )
+        .with_source(e)
+    })?;
+
+    serde.try_into(partition_spec_id, partition_type, schema)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::sync::Arc;
 
+    use serde_json::Value;
     use tempfile::TempDir;
 
     use super::*;
@@ -215,7 +257,7 @@ mod tests {
                     snapshot_id: None,
                     sequence_number: None,
                     file_sequence_number: None,
-                    data_file: DataFile {content:DataContentType::Data,file_path:"s3a://icebergdata/demo/s1/t1/data/00000-0-ba56fbfa-f2ff-40c9-bb27-565ad6dc2be8-00000.parquet".to_string(),file_format:DataFileFormat::Parquet,partition:Struct::empty(),record_count:1,file_size_in_bytes:5442,column_sizes:HashMap::from([(0,73),(6,34),(2,73),(7,61),(3,61),(5,62),(9,79),(10,73),(1,61),(4,73),(8,73)]),value_counts:HashMap::from([(4,1),(5,1),(2,1),(0,1),(3,1),(6,1),(8,1),(1,1),(10,1),(7,1),(9,1)]),null_value_counts:HashMap::from([(1,0),(6,0),(2,0),(8,0),(0,0),(3,0),(5,0),(9,0),(7,0),(4,0),(10,0)]),nan_value_counts:HashMap::new(),lower_bounds:HashMap::new(),upper_bounds:HashMap::new(),key_metadata:None,split_offsets:vec![4],equality_ids:Vec::new(),sort_order_id:None, partition_spec_id: 0,first_row_id: None,referenced_data_file: None,content_offset: None,content_size_in_bytes: None }
+                    data_file: DataFile {content:DataContentType::Data,file_path:"s3a://icebergdata/demo/s1/t1/data/00000-0-ba56fbfa-f2ff-40c9-bb27-565ad6dc2be8-00000.parquet".to_string(),file_format:DataFileFormat::Parquet,partition:Struct::empty(),record_count:1,file_size_in_bytes:5442,column_sizes:HashMap::from([(0,73),(6,34),(2,73),(7,61),(3,61),(5,62),(9,79),(10,73),(1,61),(4,73),(8,73)]),value_counts:HashMap::from([(4,1),(5,1),(2,1),(0,1),(3,1),(6,1),(8,1),(1,1),(10,1),(7,1),(9,1)]),null_value_counts:HashMap::from([(1,0),(6,0),(2,0),(8,0),(0,0),(3,0),(5,0),(9,0),(7,0),(4,0),(10,0)]),nan_value_counts:HashMap::new(),lower_bounds:HashMap::new(),upper_bounds:HashMap::new(),key_metadata:None,split_offsets:Some(vec![4]),equality_ids:Some(Vec::new()),sort_order_id:None, partition_spec_id: 0,first_row_id: None,referenced_data_file: None,content_offset: None,content_size_in_bytes: None }
                 }
             ];
 
@@ -227,7 +269,7 @@ mod tests {
         let mut writer = ManifestWriterBuilder::new(
             output_file,
             Some(1),
-            vec![],
+            None,
             metadata.schema.clone(),
             metadata.partition_spec.clone(),
         )
@@ -393,8 +435,8 @@ mod tests {
                     lower_bounds: HashMap::new(),
                     upper_bounds: HashMap::new(),
                     key_metadata: None,
-                    split_offsets: vec![4],
-                    equality_ids: vec![],
+                    split_offsets: Some(vec![4]),
+                    equality_ids: Some(Vec::new()),
                     sort_order_id: None,
                     partition_spec_id: 0,
                     first_row_id: None,
@@ -412,7 +454,7 @@ mod tests {
         let mut writer = ManifestWriterBuilder::new(
             output_file,
             Some(2),
-            vec![],
+            None,
             metadata.schema.clone(),
             metadata.partition_spec.clone(),
         )
@@ -490,8 +532,8 @@ mod tests {
                     lower_bounds: HashMap::from([(1,Datum::int(1)),(2,Datum::string("a")),(3,Datum::string("AC/DC"))]),
                     upper_bounds: HashMap::from([(1,Datum::int(1)),(2,Datum::string("a")),(3,Datum::string("AC/DC"))]),
                     key_metadata: None,
-                    split_offsets: vec![4],
-                    equality_ids: vec![],
+                    split_offsets: Some(vec![4]),
+                    equality_ids: None,
                     sort_order_id: Some(0),
                     partition_spec_id: 0,
                     first_row_id: None,
@@ -509,7 +551,7 @@ mod tests {
         let mut writer = ManifestWriterBuilder::new(
             output_file,
             Some(3),
-            vec![],
+            None,
             metadata.schema.clone(),
             metadata.partition_spec.clone(),
         )
@@ -598,8 +640,8 @@ mod tests {
                         (3, Datum::string("x"))
                         ]),
                         key_metadata: None,
-                        split_offsets: vec![4],
-                        equality_ids: vec![],
+                        split_offsets: Some(vec![4]),
+                        equality_ids: None,
                         sort_order_id: Some(0),
                         partition_spec_id: 0,
                         first_row_id: None,
@@ -618,7 +660,7 @@ mod tests {
         let mut writer = ManifestWriterBuilder::new(
             output_file,
             Some(2),
-            vec![],
+            None,
             metadata.schema.clone(),
             metadata.partition_spec.clone(),
         )
@@ -627,14 +669,15 @@ mod tests {
             writer.add_entry(entry.clone()).unwrap();
         }
         let manifest_file = writer.write_manifest_file().await.unwrap();
-        assert_eq!(manifest_file.partitions.len(), 1);
+        let partitions = manifest_file.partitions.unwrap();
+        assert_eq!(partitions.len(), 1);
         assert_eq!(
-            manifest_file.partitions[0].lower_bound,
-            Some(Datum::string("x"))
+            partitions[0].clone().lower_bound.unwrap(),
+            Datum::string("x").to_bytes().unwrap()
         );
         assert_eq!(
-            manifest_file.partitions[0].upper_bound,
-            Some(Datum::string("x"))
+            partitions[0].clone().upper_bound.unwrap(),
+            Datum::string("x").to_bytes().unwrap()
         );
 
         // read back the manifest file and check the content
@@ -706,8 +749,8 @@ mod tests {
                         (3, Datum::string("x"))
                     ]),
                     key_metadata: None,
-                    split_offsets: vec![4],
-                    equality_ids: vec![],
+                    split_offsets: Some(vec![4]),
+                    equality_ids: None,
                     sort_order_id: None,
                     partition_spec_id: 0,
                     first_row_id: None,
@@ -725,7 +768,7 @@ mod tests {
         let mut writer = ManifestWriterBuilder::new(
             output_file,
             Some(2),
-            vec![],
+            None,
             metadata.schema.clone(),
             metadata.partition_spec.clone(),
         )
@@ -797,8 +840,8 @@ mod tests {
                         (2, Datum::int(2)),
                     ]),
                     key_metadata: None,
-                    split_offsets: vec![4],
-                    equality_ids: vec![],
+                    split_offsets: Some(vec![4]),
+                    equality_ids: None,
                     sort_order_id: None,
                     partition_spec_id: 0,
                     first_row_id: None,
@@ -879,8 +922,8 @@ mod tests {
                     lower_bounds: HashMap::new(),
                     upper_bounds: HashMap::new(),
                     key_metadata: None,
-                    split_offsets: vec![4],
-                    equality_ids: Vec::new(),
+                    split_offsets: Some(vec![4]),
+                    equality_ids: None,
                     sort_order_id: None,
                     partition_spec_id: 0,
                     first_row_id: None,
@@ -914,8 +957,8 @@ mod tests {
                         lower_bounds: HashMap::new(),
                         upper_bounds: HashMap::new(),
                         key_metadata: None,
-                        split_offsets: vec![4],
-                        equality_ids: Vec::new(),
+                        split_offsets: Some(vec![4]),
+                        equality_ids: None,
                         sort_order_id: None,
                         partition_spec_id: 0,
                         first_row_id: None,
@@ -949,8 +992,8 @@ mod tests {
                         lower_bounds: HashMap::new(),
                         upper_bounds: HashMap::new(),
                         key_metadata: None,
-                        split_offsets: vec![4],
-                        equality_ids: Vec::new(),
+                        split_offsets: Some(vec![4]),
+                        equality_ids: None,
                         sort_order_id: None,
                         partition_spec_id: 0,
                         first_row_id: None,
@@ -984,8 +1027,8 @@ mod tests {
                         lower_bounds: HashMap::new(),
                         upper_bounds: HashMap::new(),
                         key_metadata: None,
-                        split_offsets: vec![4],
-                        equality_ids: Vec::new(),
+                        split_offsets: Some(vec![4]),
+                        equality_ids: None,
                         sort_order_id: None,
                         partition_spec_id: 0,
                         first_row_id: None,
@@ -1004,7 +1047,7 @@ mod tests {
         let mut writer = ManifestWriterBuilder::new(
             output_file,
             Some(1),
-            vec![],
+            None,
             metadata.schema.clone(),
             metadata.partition_spec.clone(),
         )
@@ -1014,20 +1057,195 @@ mod tests {
         }
         let res = writer.write_manifest_file().await.unwrap();
 
-        assert_eq!(res.partitions.len(), 3);
-        assert_eq!(res.partitions[0].lower_bound, Some(Datum::int(1111)));
-        assert_eq!(res.partitions[0].upper_bound, Some(Datum::int(2021)));
-        assert!(!res.partitions[0].contains_null);
-        assert_eq!(res.partitions[0].contains_nan, Some(false));
+        let partitions = res.partitions.unwrap();
 
-        assert_eq!(res.partitions[1].lower_bound, Some(Datum::float(1.0)));
-        assert_eq!(res.partitions[1].upper_bound, Some(Datum::float(15.5)));
-        assert!(res.partitions[1].contains_null);
-        assert_eq!(res.partitions[1].contains_nan, Some(true));
+        assert_eq!(partitions.len(), 3);
+        assert_eq!(
+            partitions[0].clone().lower_bound.unwrap(),
+            Datum::int(1111).to_bytes().unwrap()
+        );
+        assert_eq!(
+            partitions[0].clone().upper_bound.unwrap(),
+            Datum::int(2021).to_bytes().unwrap()
+        );
+        assert!(!partitions[0].clone().contains_null);
+        assert_eq!(partitions[0].clone().contains_nan, Some(false));
 
-        assert_eq!(res.partitions[2].lower_bound, Some(Datum::double(1.0)));
-        assert_eq!(res.partitions[2].upper_bound, Some(Datum::double(25.5)));
-        assert!(!res.partitions[2].contains_null);
-        assert_eq!(res.partitions[2].contains_nan, Some(false));
+        assert_eq!(
+            partitions[1].clone().lower_bound.unwrap(),
+            Datum::float(1.0).to_bytes().unwrap()
+        );
+        assert_eq!(
+            partitions[1].clone().upper_bound.unwrap(),
+            Datum::float(15.5).to_bytes().unwrap()
+        );
+        assert!(partitions[1].clone().contains_null);
+        assert_eq!(partitions[1].clone().contains_nan, Some(true));
+
+        assert_eq!(
+            partitions[2].clone().lower_bound.unwrap(),
+            Datum::double(1.0).to_bytes().unwrap()
+        );
+        assert_eq!(
+            partitions[2].clone().upper_bound.unwrap(),
+            Datum::double(25.5).to_bytes().unwrap()
+        );
+        assert!(!partitions[2].clone().contains_null);
+        assert_eq!(partitions[2].clone().contains_nan, Some(false));
+    }
+
+    #[test]
+    fn test_data_file_serialization() {
+        // Create a simple schema
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_identifier_field_ids(vec![1])
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        // Create a partition spec
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(1)
+            .add_partition_field("id", "id_partition", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Get partition type from the partition spec
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+
+        // Create a vector of DataFile objects
+        let data_files = vec![
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_format(DataFileFormat::Parquet)
+                .file_path("path/to/file1.parquet".to_string())
+                .file_size_in_bytes(1024)
+                .record_count(100)
+                .partition_spec_id(1)
+                .partition(Struct::empty())
+                .column_sizes(HashMap::from([(1, 512), (2, 1024)]))
+                .value_counts(HashMap::from([(1, 100), (2, 500)]))
+                .null_value_counts(HashMap::from([(1, 0), (2, 1)]))
+                .build()
+                .unwrap(),
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_format(DataFileFormat::Parquet)
+                .file_path("path/to/file2.parquet".to_string())
+                .file_size_in_bytes(2048)
+                .record_count(200)
+                .partition_spec_id(1)
+                .partition(Struct::empty())
+                .column_sizes(HashMap::from([(1, 1024), (2, 2048)]))
+                .value_counts(HashMap::from([(1, 200), (2, 600)]))
+                .null_value_counts(HashMap::from([(1, 10), (2, 999)]))
+                .build()
+                .unwrap(),
+        ];
+
+        // Serialize the DataFile objects
+        let serialized_files = data_files
+            .clone()
+            .into_iter()
+            .map(|f| serialize_data_file_to_json(f, &partition_type, FormatVersion::V2).unwrap())
+            .collect::<Vec<String>>();
+
+        // Verify we have the expected serialized files
+        assert_eq!(serialized_files.len(), 2);
+        let pretty_json1: Value = serde_json::from_str(serialized_files.first().unwrap()).unwrap();
+        let pretty_json2: Value = serde_json::from_str(serialized_files.get(1).unwrap()).unwrap();
+        let expected_serialized_file1 = serde_json::json!({
+            "content": 0,
+            "file_path": "path/to/file1.parquet",
+            "file_format": "PARQUET",
+            "partition": {},
+            "record_count": 100,
+            "file_size_in_bytes": 1024,
+            "column_sizes": [
+                { "key": 1, "value": 512 },
+                { "key": 2, "value": 1024 }
+            ],
+            "value_counts": [
+                { "key": 1, "value": 100 },
+                { "key": 2, "value": 500 }
+            ],
+            "null_value_counts": [
+                { "key": 1, "value": 0 },
+                { "key": 2, "value": 1 }
+            ],
+            "nan_value_counts": [],
+            "lower_bounds": [],
+            "upper_bounds": [],
+            "key_metadata": null,
+            "split_offsets": null,
+            "equality_ids": null,
+            "sort_order_id": null,
+            "first_row_id": null,
+            "referenced_data_file": null,
+            "content_offset": null,
+            "content_size_in_bytes": null
+        });
+        let expected_serialized_file2 = serde_json::json!({
+            "content": 0,
+            "file_path": "path/to/file2.parquet",
+            "file_format": "PARQUET",
+            "partition": {},
+            "record_count": 200,
+            "file_size_in_bytes": 2048,
+            "column_sizes": [
+                { "key": 1, "value": 1024 },
+                { "key": 2, "value": 2048 }
+            ],
+            "value_counts": [
+                { "key": 1, "value": 200 },
+                { "key": 2, "value": 600 }
+            ],
+            "null_value_counts": [
+                { "key": 1, "value": 10 },
+                { "key": 2, "value": 999 }
+            ],
+            "nan_value_counts": [],
+            "lower_bounds": [],
+            "upper_bounds": [],
+            "key_metadata": null,
+            "split_offsets": null,
+            "equality_ids": null,
+            "sort_order_id": null,
+            "first_row_id": null,
+            "referenced_data_file": null,
+            "content_offset": null,
+            "content_size_in_bytes": null
+        });
+        assert_eq!(pretty_json1, expected_serialized_file1);
+        assert_eq!(pretty_json2, expected_serialized_file2);
+
+        // Now deserialize the JSON strings back into DataFile objects
+        let deserialized_files: Vec<DataFile> = serialized_files
+            .into_iter()
+            .map(|json| {
+                deserialize_data_file_from_json(
+                    &json,
+                    partition_spec.spec_id(),
+                    &partition_type,
+                    &schema,
+                )
+                .unwrap()
+            })
+            .collect();
+
+        // Verify we have the expected number of deserialized files
+        assert_eq!(deserialized_files.len(), 2);
+        let deserialized_data_file1 = deserialized_files.first().unwrap();
+        let deserialized_data_file2 = deserialized_files.get(1).unwrap();
+        let original_data_file1 = data_files.first().unwrap();
+        let original_data_file2 = data_files.get(1).unwrap();
+
+        assert_eq!(deserialized_data_file1, original_data_file1);
+        assert_eq!(deserialized_data_file2, original_data_file2);
     }
 }

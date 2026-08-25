@@ -22,7 +22,6 @@ use aws_sdk_glue::config::Credentials;
 use aws_sdk_glue::types::{Database, DatabaseInput, StorageDescriptor, TableInput};
 use iceberg::spec::TableMetadata;
 use iceberg::{Error, ErrorKind, Namespace, NamespaceIdent, Result};
-use uuid::Uuid;
 
 use crate::error::from_aws_build_error;
 use crate::schema::GlueSchemaBuilder;
@@ -151,7 +150,7 @@ pub(crate) fn convert_to_glue_table(
 
     let storage_descriptor = StorageDescriptor::builder()
         .set_columns(Some(glue_schema))
-        .location(&metadata_location)
+        .location(metadata.location().to_string())
         .build();
 
     let mut parameters = HashMap::from([
@@ -186,8 +185,7 @@ pub(crate) fn validate_namespace(namespace: &NamespaceIdent) -> Result<String> {
         return Err(Error::new(
             ErrorKind::DataInvalid,
             format!(
-                "Invalid database name: {:?}, hierarchical namespaces are not supported",
-                namespace
+                "Invalid database name: {namespace:?}, hierarchical namespaces are not supported"
             ),
         ));
     }
@@ -228,30 +226,6 @@ pub(crate) fn get_default_table_location(
     }
 }
 
-/// Create metadata location from `location` and `version`
-pub(crate) fn create_metadata_location(location: impl AsRef<str>, version: i32) -> Result<String> {
-    if version < 0 {
-        return Err(Error::new(
-            ErrorKind::DataInvalid,
-            format!(
-                "Table metadata version: '{}' must be a non-negative integer",
-                version
-            ),
-        ));
-    };
-
-    let version = format!("{:0>5}", version);
-    let id = Uuid::new_v4();
-    let metadata_location = format!(
-        "{}/metadata/{}-{}.metadata.json",
-        location.as_ref(),
-        version,
-        id
-    );
-
-    Ok(metadata_location)
-}
-
 /// Get metadata location from `GlueTable` parameters
 pub(crate) fn get_metadata_location(
     parameters: &Option<HashMap<String, String>>,
@@ -261,7 +235,7 @@ pub(crate) fn get_metadata_location(
             Some(location) => Ok(location.to_string()),
             None => Err(Error::new(
                 ErrorKind::DataInvalid,
-                format!("No '{}' set on table", METADATA_LOCATION),
+                format!("No '{METADATA_LOCATION}' set on table"),
             )),
         },
         None => Err(Error::new(
@@ -288,7 +262,7 @@ mod tests {
     use aws_sdk_glue::config::ProvideCredentials;
     use aws_sdk_glue::types::Column;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, TableMetadataBuilder, Type};
-    use iceberg::{Namespace, Result, TableCreation};
+    use iceberg::{MetadataLocation, Namespace, Result, TableCreation};
 
     use super::*;
     use crate::schema::{ICEBERG_FIELD_CURRENT, ICEBERG_FIELD_ID, ICEBERG_FIELD_OPTIONAL};
@@ -332,7 +306,7 @@ mod tests {
     fn test_convert_to_glue_table() -> Result<()> {
         let table_name = "my_table".to_string();
         let location = "s3a://warehouse/hive".to_string();
-        let metadata_location = create_metadata_location(location.clone(), 0)?;
+        let metadata_location = MetadataLocation::new_with_table_location(location).to_string();
         let properties = HashMap::new();
         let schema = Schema::builder()
             .with_schema_id(1)
@@ -345,7 +319,7 @@ mod tests {
 
         let parameters = HashMap::from([
             (ICEBERG_FIELD_ID.to_string(), "1".to_string()),
-            (ICEBERG_FIELD_OPTIONAL.to_string(), "true".to_string()),
+            (ICEBERG_FIELD_OPTIONAL.to_string(), "false".to_string()),
             (ICEBERG_FIELD_CURRENT.to_string(), "true".to_string()),
         ]);
 
@@ -359,7 +333,7 @@ mod tests {
 
         let storage_descriptor = StorageDescriptor::builder()
             .set_columns(Some(vec![column]))
-            .location(&metadata_location)
+            .location(metadata.location())
             .build();
 
         let result =
@@ -368,22 +342,6 @@ mod tests {
         assert_eq!(result.name(), &table_name);
         assert_eq!(result.description(), None);
         assert_eq!(result.storage_descriptor, Some(storage_descriptor));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_metadata_location() -> Result<()> {
-        let location = "my_base_location";
-        let valid_version = 0;
-        let invalid_version = -1;
-
-        let valid_result = create_metadata_location(location, valid_version)?;
-        let invalid_result = create_metadata_location(location, invalid_version);
-
-        assert!(valid_result.starts_with("my_base_location/metadata/00000-"));
-        assert!(valid_result.ends_with(".metadata.json"));
-        assert!(invalid_result.is_err());
 
         Ok(())
     }

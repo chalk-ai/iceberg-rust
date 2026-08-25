@@ -36,6 +36,7 @@ use crate::delete_file_index::DeleteFileIndex;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::FileIO;
+use crate::metadata_columns::{get_metadata_field_id, is_metadata_column_name};
 use crate::runtime::spawn;
 use crate::spec::{DataContentType, SnapshotRef};
 use crate::table::Table;
@@ -59,11 +60,6 @@ pub struct TableScanBuilder<'a> {
     concurrency_limit_manifest_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
-
-    // TODO: defaults to false for now whilst delete file processing
-    // is still being worked on but will switch to a default of true
-    // once this work is complete
-    delete_file_processing_enabled: bool,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -82,7 +78,6 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
-            delete_file_processing_enabled: false,
         }
     }
 
@@ -189,17 +184,6 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
-    /// Determines whether to enable delete file processing (currently disabled by default)
-    ///
-    /// When disabled, delete files are ignored.
-    pub fn with_delete_file_processing_enabled(
-        mut self,
-        delete_file_processing_enabled: bool,
-    ) -> Self {
-        self.delete_file_processing_enabled = delete_file_processing_enabled;
-        self
-    }
-
     /// Build the table scan.
     pub fn build(self) -> Result<TableScan> {
         let snapshot = match self.snapshot_id {
@@ -210,7 +194,7 @@ impl<'a> TableScanBuilder<'a> {
                 .ok_or_else(|| {
                     Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Snapshot with id {} not found", snapshot_id),
+                        format!("Snapshot with id {snapshot_id} not found"),
                     )
                 })?
                 .clone(),
@@ -226,7 +210,6 @@ impl<'a> TableScanBuilder<'a> {
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
-                        delete_file_processing_enabled: self.delete_file_processing_enabled,
                     });
                 };
                 current_snapshot_id.clone()
@@ -235,16 +218,17 @@ impl<'a> TableScanBuilder<'a> {
 
         let schema = snapshot.schema(self.table.metadata())?;
 
-        // Check that all column names exist in the schema.
+        // Check that all column names exist in the schema (skip reserved columns).
         if let Some(column_names) = self.column_names.as_ref() {
             for column_name in column_names {
+                // Skip reserved columns that don't exist in the schema
+                if is_metadata_column_name(column_name) {
+                    continue;
+                }
                 if schema.field_by_name(column_name).is_none() {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
-                        format!(
-                            "Column {} not found in table. Schema: {}",
-                            column_name, schema
-                        ),
+                        format!("Column {column_name} not found in table. Schema: {schema}"),
                     ));
                 }
             }
@@ -261,13 +245,16 @@ impl<'a> TableScanBuilder<'a> {
         });
 
         for column_name in column_names.iter() {
+            // Handle metadata columns (like "_file")
+            if is_metadata_column_name(column_name) {
+                field_ids.push(get_metadata_field_id(column_name)?);
+                continue;
+            }
+
             let field_id = schema.field_id_by_name(column_name).ok_or_else(|| {
                 Error::new(
                     ErrorKind::DataInvalid,
-                    format!(
-                        "Column {} not found in table. Schema: {}",
-                        column_name, schema
-                    ),
+                    format!("Column {column_name} not found in table. Schema: {schema}"),
                 )
             })?;
 
@@ -278,11 +265,10 @@ impl<'a> TableScanBuilder<'a> {
                     Error::new(
                         ErrorKind::FeatureUnsupported,
                         format!(
-                            "Column {} is not a direct child of schema but a nested field, which is not supported now. Schema: {}",
-                            column_name, schema
-                        ),
-                    )
-                })?;
+                        "Column {column_name} is not a direct child of schema but a nested field, which is not supported now. Schema: {schema}"
+                    ),
+                )
+            })?;
 
             field_ids.push(field_id);
         }
@@ -317,7 +303,6 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
-            delete_file_processing_enabled: self.delete_file_processing_enabled,
         })
     }
 }
@@ -346,7 +331,6 @@ pub struct TableScan {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
-    delete_file_processing_enabled: bool,
 }
 
 impl TableScan {
@@ -368,12 +352,7 @@ impl TableScan {
         // used to stream the results back to the caller
         let (file_scan_task_tx, file_scan_task_rx) = channel(concurrency_limit_manifest_entries);
 
-        let delete_file_idx_and_tx: Option<(DeleteFileIndex, Sender<DeleteFileContext>)> =
-            if self.delete_file_processing_enabled {
-                Some(DeleteFileIndex::new())
-            } else {
-                None
-            };
+        let (delete_file_idx, delete_file_tx) = DeleteFileIndex::new();
 
         let manifest_list = plan_context.get_manifest_list().await?;
 
@@ -383,9 +362,8 @@ impl TableScan {
         let manifest_file_contexts = plan_context.build_manifest_file_contexts(
             manifest_list,
             manifest_entry_data_ctx_tx,
-            delete_file_idx_and_tx.as_ref().map(|(delete_file_idx, _)| {
-                (delete_file_idx.clone(), manifest_entry_delete_ctx_tx)
-            }),
+            delete_file_idx.clone(),
+            manifest_entry_delete_ctx_tx,
         )?;
 
         let mut channel_for_manifest_error = file_scan_task_tx.clone();
@@ -404,34 +382,30 @@ impl TableScan {
         });
 
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
+        let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
 
-        if let Some((_, delete_file_tx)) = delete_file_idx_and_tx {
-            let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
+        // Process the delete file [`ManifestEntry`] stream in parallel
+        spawn(async move {
+            let result = manifest_entry_delete_ctx_rx
+                .map(|me_ctx| Ok((me_ctx, delete_file_tx.clone())))
+                .try_for_each_concurrent(
+                    concurrency_limit_manifest_entries,
+                    |(manifest_entry_context, tx)| async move {
+                        spawn(async move {
+                            Self::process_delete_manifest_entry(manifest_entry_context, tx).await
+                        })
+                        .await
+                    },
+                )
+                .await;
 
-            // Process the delete file [`ManifestEntry`] stream in parallel
-            spawn(async move {
-                let result = manifest_entry_delete_ctx_rx
-                    .map(|me_ctx| Ok((me_ctx, delete_file_tx.clone())))
-                    .try_for_each_concurrent(
-                        concurrency_limit_manifest_entries,
-                        |(manifest_entry_context, tx)| async move {
-                            spawn(async move {
-                                Self::process_delete_manifest_entry(manifest_entry_context, tx)
-                                    .await
-                            })
-                            .await
-                        },
-                    )
+            if let Err(error) = result {
+                let _ = channel_for_delete_manifest_entry_error
+                    .send(Err(error))
                     .await;
-
-                if let Err(error) = result {
-                    let _ = channel_for_delete_manifest_entry_error
-                        .send(Err(error))
-                        .await;
-                }
-            })
-            .await;
-        }
+            }
+        })
+        .await;
 
         // Process the data file [`ManifestEntry`] stream in parallel
         spawn(async move {
@@ -467,10 +441,7 @@ impl TableScan {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
         }
 
-        arrow_reader_builder
-            .build()
-            .read(self.plan_files().await?)
-            .await
+        arrow_reader_builder.build().read(self.plan_files().await?)
     }
 
     /// Returns a reference to the column names of the table scan.
@@ -599,21 +570,25 @@ pub mod tests {
     use std::fs::File;
     use std::sync::Arc;
 
+    use arrow_array::cast::AsArray;
     use arrow_array::{
-        ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch,
+        StringArray,
     };
     use futures::{TryStreamExt, stream};
+    use minijinja::value::Value;
+    use minijinja::{AutoEscape, Environment, context};
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
-    use tera::{Context, Tera};
     use uuid::Uuid;
 
     use crate::TableIdent;
     use crate::arrow::ArrowReaderBuilder;
     use crate::expr::{BoundPredicate, Reference};
     use crate::io::{FileIO, OutputFile};
+    use crate::metadata_columns::RESERVED_COL_NAME_FILE;
     use crate::scan::FileScanTask;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, ManifestEntry,
@@ -621,6 +596,12 @@ pub mod tests {
         PrimitiveType, Schema, Struct, StructType, TableMetadata, Type,
     };
     use crate::table::Table;
+
+    fn render_template(template: &str, ctx: Value) -> String {
+        let mut env = Environment::new();
+        env.set_auto_escape_callback(|_| AutoEscape::None);
+        env.render_str(template, ctx).unwrap()
+    }
 
     pub struct TableTestFixture {
         pub table_location: String,
@@ -647,13 +628,12 @@ pub mod tests {
                     env!("CARGO_MANIFEST_DIR")
                 ))
                 .unwrap();
-                let mut context = Context::new();
-                context.insert("table_location", &table_location);
-                context.insert("manifest_list_1_location", &manifest_list1_location);
-                context.insert("manifest_list_2_location", &manifest_list2_location);
-                context.insert("table_metadata_1_location", &table_metadata1_location);
-
-                let metadata_json = Tera::one_off(&template_json_str, &context, false).unwrap();
+                let metadata_json = render_template(&template_json_str, context! {
+                    table_location => &table_location,
+                    manifest_list_1_location => &manifest_list1_location,
+                    manifest_list_2_location => &manifest_list2_location,
+                    table_metadata_1_location => &table_metadata1_location,
+                });
                 serde_json::from_str::<TableMetadata>(&metadata_json).unwrap()
             };
 
@@ -688,11 +668,10 @@ pub mod tests {
                     env!("CARGO_MANIFEST_DIR")
                 ))
                 .unwrap();
-                let mut context = Context::new();
-                context.insert("table_location", &table_location);
-                context.insert("table_metadata_1_location", &table_metadata1_location);
-
-                let metadata_json = Tera::one_off(&template_json_str, &context, false).unwrap();
+                let metadata_json = render_template(&template_json_str, context! {
+                    table_location => &table_location,
+                    table_metadata_1_location => &table_metadata1_location,
+                });
                 serde_json::from_str::<TableMetadata>(&metadata_json).unwrap()
             };
 
@@ -728,13 +707,12 @@ pub mod tests {
                     env!("CARGO_MANIFEST_DIR")
                 ))
                 .unwrap();
-                let mut context = Context::new();
-                context.insert("table_location", &table_location);
-                context.insert("manifest_list_1_location", &manifest_list1_location);
-                context.insert("manifest_list_2_location", &manifest_list2_location);
-                context.insert("table_metadata_1_location", &table_metadata1_location);
-
-                let metadata_json = Tera::one_off(&template_json_str, &context, false).unwrap();
+                let metadata_json = render_template(&template_json_str, context! {
+                    table_location => &table_location,
+                    manifest_list_1_location => &manifest_list1_location,
+                    manifest_list_2_location => &manifest_list2_location,
+                    table_metadata_1_location => &table_metadata1_location,
+                });
                 serde_json::from_str::<TableMetadata>(&metadata_json).unwrap()
             };
 
@@ -782,7 +760,7 @@ pub mod tests {
             let mut writer = ManifestWriterBuilder::new(
                 self.next_manifest_file(),
                 Some(current_snapshot.snapshot_id()),
-                vec![],
+                None,
                 current_schema.clone(),
                 current_partition_spec.as_ref().clone(),
             )
@@ -994,7 +972,7 @@ pub mod tests {
             let mut writer = ManifestWriterBuilder::new(
                 self.next_manifest_file(),
                 Some(current_snapshot.snapshot_id()),
-                vec![],
+                None,
                 current_schema.clone(),
                 current_partition_spec.as_ref().clone(),
             )
@@ -1192,6 +1170,97 @@ pub mod tests {
                 writer.close().unwrap();
             }
         }
+
+        pub async fn setup_deadlock_manifests(&mut self) {
+            let current_snapshot = self.table.metadata().current_snapshot().unwrap();
+            let _parent_snapshot = current_snapshot
+                .parent_snapshot(self.table.metadata())
+                .unwrap();
+            let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
+            let current_partition_spec = self.table.metadata().default_partition_spec();
+
+            // 1. Write DATA manifest with MULTIPLE entries to fill buffer
+            let mut writer = ManifestWriterBuilder::new(
+                self.next_manifest_file(),
+                Some(current_snapshot.snapshot_id()),
+                None,
+                current_schema.clone(),
+                current_partition_spec.as_ref().clone(),
+            )
+            .build_v2_data();
+
+            // Add 10 data entries
+            for i in 0..10 {
+                writer
+                    .add_entry(
+                        ManifestEntry::builder()
+                            .status(ManifestStatus::Added)
+                            .data_file(
+                                DataFileBuilder::default()
+                                    .partition_spec_id(0)
+                                    .content(DataContentType::Data)
+                                    .file_path(format!("{}/{}.parquet", &self.table_location, i))
+                                    .file_format(DataFileFormat::Parquet)
+                                    .file_size_in_bytes(100)
+                                    .record_count(1)
+                                    .partition(Struct::from_iter([Some(Literal::long(100))]))
+                                    .key_metadata(None)
+                                    .build()
+                                    .unwrap(),
+                            )
+                            .build(),
+                    )
+                    .unwrap();
+            }
+            let data_manifest = writer.write_manifest_file().await.unwrap();
+
+            // 2. Write DELETE manifest
+            let mut writer = ManifestWriterBuilder::new(
+                self.next_manifest_file(),
+                Some(current_snapshot.snapshot_id()),
+                None,
+                current_schema.clone(),
+                current_partition_spec.as_ref().clone(),
+            )
+            .build_v2_deletes();
+
+            writer
+                .add_entry(
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .data_file(
+                            DataFileBuilder::default()
+                                .partition_spec_id(0)
+                                .content(DataContentType::PositionDeletes)
+                                .file_path(format!("{}/del.parquet", &self.table_location))
+                                .file_format(DataFileFormat::Parquet)
+                                .file_size_in_bytes(100)
+                                .record_count(1)
+                                .partition(Struct::from_iter([Some(Literal::long(100))]))
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .unwrap();
+            let delete_manifest = writer.write_manifest_file().await.unwrap();
+
+            // Write to manifest list - DATA FIRST then DELETE
+            // This order is crucial for reproduction
+            let mut manifest_list_write = ManifestListWriter::v2(
+                self.table
+                    .file_io()
+                    .new_output(current_snapshot.manifest_list())
+                    .unwrap(),
+                current_snapshot.snapshot_id(),
+                current_snapshot.parent_snapshot_id(),
+                current_snapshot.sequence_number(),
+            );
+            manifest_list_write
+                .add_manifests(vec![data_manifest, delete_manifest].into_iter())
+                .unwrap();
+            manifest_list_write.close().await.unwrap();
+        }
     }
 
     #[test]
@@ -1362,14 +1431,12 @@ pub mod tests {
         let batch_stream = reader
             .clone()
             .read(Box::pin(stream::iter(vec![Ok(plan_task.remove(0))])))
-            .await
             .unwrap();
         let batch_1: Vec<_> = batch_stream.try_collect().await.unwrap();
 
         let reader = ArrowReaderBuilder::new(fixture.table.file_io().clone()).build();
         let batch_stream = reader
             .read(Box::pin(stream::iter(vec![Ok(plan_task.remove(0))])))
-            .await
             .unwrap();
         let batch_2: Vec<_> = batch_stream.try_collect().await.unwrap();
 
@@ -1807,7 +1874,6 @@ pub mod tests {
         );
         let task = FileScanTask {
             data_file_path: "data_file_path".to_string(),
-            data_file_content: DataContentType::Data,
             start: 0,
             length: 100,
             project_field_ids: vec![1, 2, 3],
@@ -1816,13 +1882,16 @@ pub mod tests {
             record_count: Some(100),
             data_file_format: DataFileFormat::Parquet,
             deletes: vec![],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
         };
         test_fn(task);
 
         // with predicate
         let task = FileScanTask {
             data_file_path: "data_file_path".to_string(),
-            data_file_content: DataContentType::Data,
             start: 0,
             length: 100,
             project_field_ids: vec![1, 2, 3],
@@ -1831,7 +1900,358 @@ pub mod tests {
             record_count: None,
             data_file_format: DataFileFormat::Avro,
             deletes: vec![],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
         };
         test_fn(task);
+    }
+
+    #[tokio::test]
+    async fn test_select_with_file_column() {
+        use arrow_array::cast::AsArray;
+
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        // Select regular columns plus the _file column
+        let table_scan = fixture
+            .table
+            .scan()
+            .select(["x", RESERVED_COL_NAME_FILE])
+            .with_row_selection_enabled(true)
+            .build()
+            .unwrap();
+
+        let batch_stream = table_scan.to_arrow().await.unwrap();
+        let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
+
+        // Verify we have 2 columns: x and _file
+        assert_eq!(batches[0].num_columns(), 2);
+
+        // Verify the x column exists and has correct data
+        let x_col = batches[0].column_by_name("x").unwrap();
+        let x_arr = x_col.as_primitive::<arrow_array::types::Int64Type>();
+        assert_eq!(x_arr.value(0), 1);
+
+        // Verify the _file column exists
+        let file_col = batches[0].column_by_name(RESERVED_COL_NAME_FILE);
+        assert!(
+            file_col.is_some(),
+            "_file column should be present in the batch"
+        );
+
+        // Verify the _file column contains a file path
+        let file_col = file_col.unwrap();
+        assert!(
+            matches!(
+                file_col.data_type(),
+                arrow_schema::DataType::RunEndEncoded(_, _)
+            ),
+            "_file column should use RunEndEncoded type"
+        );
+
+        // Decode the RunArray to verify it contains the file path
+        let run_array = file_col
+            .as_any()
+            .downcast_ref::<arrow_array::RunArray<arrow_array::types::Int32Type>>()
+            .expect("_file column should be a RunArray");
+
+        let values = run_array.values();
+        let string_values = values.as_string::<i32>();
+        assert_eq!(string_values.len(), 1, "Should have a single file path");
+
+        let file_path = string_values.value(0);
+        assert!(
+            file_path.ends_with(".parquet"),
+            "File path should end with .parquet, got: {file_path}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_select_file_column_position() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        // Select columns in specific order: x, _file, z
+        let table_scan = fixture
+            .table
+            .scan()
+            .select(["x", RESERVED_COL_NAME_FILE, "z"])
+            .with_row_selection_enabled(true)
+            .build()
+            .unwrap();
+
+        let batch_stream = table_scan.to_arrow().await.unwrap();
+        let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
+
+        assert_eq!(batches[0].num_columns(), 3);
+
+        // Verify column order: x at position 0, _file at position 1, z at position 2
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(0).name(), "x");
+        assert_eq!(schema.field(1).name(), RESERVED_COL_NAME_FILE);
+        assert_eq!(schema.field(2).name(), "z");
+
+        // Verify columns by name also works
+        assert!(batches[0].column_by_name("x").is_some());
+        assert!(batches[0].column_by_name(RESERVED_COL_NAME_FILE).is_some());
+        assert!(batches[0].column_by_name("z").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_select_file_column_only() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        // Select only the _file column
+        let table_scan = fixture
+            .table
+            .scan()
+            .select([RESERVED_COL_NAME_FILE])
+            .with_row_selection_enabled(true)
+            .build()
+            .unwrap();
+
+        let batch_stream = table_scan.to_arrow().await.unwrap();
+        let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
+
+        // Should have exactly 1 column
+        assert_eq!(batches[0].num_columns(), 1);
+
+        // Verify it's the _file column
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(0).name(), RESERVED_COL_NAME_FILE);
+
+        // Verify the batch has the correct number of rows
+        // The scan reads files 1.parquet and 3.parquet (2.parquet is deleted)
+        // Each file has 1024 rows, so total is 2048 rows
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2048);
+    }
+
+    #[tokio::test]
+    async fn test_file_column_with_multiple_files() {
+        use std::collections::HashSet;
+
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        // Select x and _file columns
+        let table_scan = fixture
+            .table
+            .scan()
+            .select(["x", RESERVED_COL_NAME_FILE])
+            .with_row_selection_enabled(true)
+            .build()
+            .unwrap();
+
+        let batch_stream = table_scan.to_arrow().await.unwrap();
+        let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
+
+        // Collect all unique file paths from the batches
+        let mut file_paths = HashSet::new();
+        for batch in &batches {
+            let file_col = batch.column_by_name(RESERVED_COL_NAME_FILE).unwrap();
+            let run_array = file_col
+                .as_any()
+                .downcast_ref::<arrow_array::RunArray<arrow_array::types::Int32Type>>()
+                .expect("_file column should be a RunArray");
+
+            let values = run_array.values();
+            let string_values = values.as_string::<i32>();
+            for i in 0..string_values.len() {
+                file_paths.insert(string_values.value(i).to_string());
+            }
+        }
+
+        // We should have multiple files (the test creates 1.parquet and 3.parquet)
+        assert!(!file_paths.is_empty(), "Should have at least one file path");
+
+        // All paths should end with .parquet
+        for path in &file_paths {
+            assert!(
+                path.ends_with(".parquet"),
+                "All file paths should end with .parquet, got: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_file_column_at_start() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        // Select _file at the start
+        let table_scan = fixture
+            .table
+            .scan()
+            .select([RESERVED_COL_NAME_FILE, "x", "y"])
+            .with_row_selection_enabled(true)
+            .build()
+            .unwrap();
+
+        let batch_stream = table_scan.to_arrow().await.unwrap();
+        let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
+
+        assert_eq!(batches[0].num_columns(), 3);
+
+        // Verify _file is at position 0
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(0).name(), RESERVED_COL_NAME_FILE);
+        assert_eq!(schema.field(1).name(), "x");
+        assert_eq!(schema.field(2).name(), "y");
+    }
+
+    #[tokio::test]
+    async fn test_file_column_at_end() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        // Select _file at the end
+        let table_scan = fixture
+            .table
+            .scan()
+            .select(["x", "y", RESERVED_COL_NAME_FILE])
+            .with_row_selection_enabled(true)
+            .build()
+            .unwrap();
+
+        let batch_stream = table_scan.to_arrow().await.unwrap();
+        let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
+
+        assert_eq!(batches[0].num_columns(), 3);
+
+        // Verify _file is at position 2 (the end)
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(0).name(), "x");
+        assert_eq!(schema.field(1).name(), "y");
+        assert_eq!(schema.field(2).name(), RESERVED_COL_NAME_FILE);
+    }
+
+    #[tokio::test]
+    async fn test_select_with_repeated_column_names() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        // Select with repeated column names - both regular columns and virtual columns
+        // Repeated columns should appear multiple times in the result (duplicates are allowed)
+        let table_scan = fixture
+            .table
+            .scan()
+            .select([
+                "x",
+                RESERVED_COL_NAME_FILE,
+                "x", // x repeated
+                "y",
+                RESERVED_COL_NAME_FILE, // _file repeated
+                "y",                    // y repeated
+            ])
+            .with_row_selection_enabled(true)
+            .build()
+            .unwrap();
+
+        let batch_stream = table_scan.to_arrow().await.unwrap();
+        let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
+
+        // Verify we have exactly 6 columns (duplicates are allowed and preserved)
+        assert_eq!(
+            batches[0].num_columns(),
+            6,
+            "Should have exactly 6 columns with duplicates"
+        );
+
+        let schema = batches[0].schema();
+
+        // Verify columns appear in the exact order requested: x, _file, x, y, _file, y
+        assert_eq!(schema.field(0).name(), "x", "Column 0 should be x");
+        assert_eq!(
+            schema.field(1).name(),
+            RESERVED_COL_NAME_FILE,
+            "Column 1 should be _file"
+        );
+        assert_eq!(
+            schema.field(2).name(),
+            "x",
+            "Column 2 should be x (duplicate)"
+        );
+        assert_eq!(schema.field(3).name(), "y", "Column 3 should be y");
+        assert_eq!(
+            schema.field(4).name(),
+            RESERVED_COL_NAME_FILE,
+            "Column 4 should be _file (duplicate)"
+        );
+        assert_eq!(
+            schema.field(5).name(),
+            "y",
+            "Column 5 should be y (duplicate)"
+        );
+
+        // Verify all columns have correct data types
+        assert!(
+            matches!(schema.field(0).data_type(), arrow_schema::DataType::Int64),
+            "Column x should be Int64"
+        );
+        assert!(
+            matches!(schema.field(2).data_type(), arrow_schema::DataType::Int64),
+            "Column x (duplicate) should be Int64"
+        );
+        assert!(
+            matches!(schema.field(3).data_type(), arrow_schema::DataType::Int64),
+            "Column y should be Int64"
+        );
+        assert!(
+            matches!(schema.field(5).data_type(), arrow_schema::DataType::Int64),
+            "Column y (duplicate) should be Int64"
+        );
+        assert!(
+            matches!(
+                schema.field(1).data_type(),
+                arrow_schema::DataType::RunEndEncoded(_, _)
+            ),
+            "_file column should use RunEndEncoded type"
+        );
+        assert!(
+            matches!(
+                schema.field(4).data_type(),
+                arrow_schema::DataType::RunEndEncoded(_, _)
+            ),
+            "_file column (duplicate) should use RunEndEncoded type"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_deadlock() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_deadlock_manifests().await;
+
+        // Create table scan with concurrency limit 1
+        // This sets channel size to 1.
+        // Data manifest has 10 entries -> will block producer.
+        // Delete manifest is 2nd in list -> won't be processed.
+        // Consumer 2 (Data) not started -> blocked.
+        // Consumer 1 (Delete) waiting -> blocked.
+        let table_scan = fixture
+            .table
+            .scan()
+            .with_concurrency_limit(1)
+            .build()
+            .unwrap();
+
+        // This should timeout/hang if deadlock exists
+        // We can use tokio::time::timeout
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            table_scan
+                .plan_files()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+        })
+        .await;
+
+        // Assert it finished (didn't timeout)
+        assert!(result.is_ok(), "Scan timed out - deadlock detected");
     }
 }

@@ -15,19 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
     FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
     LargeListArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
     Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
-use arrow_schema::DataType;
+use arrow_buffer::NullBuffer;
+use arrow_schema::{DataType, FieldRef};
 use uuid::Uuid;
 
-use super::get_field_id;
+use super::get_field_id_from_metadata;
 use crate::spec::{
-    ListType, Literal, Map, MapType, NestedField, PartnerAccessor, PrimitiveType,
-    SchemaWithPartnerVisitor, Struct, StructType, visit_struct_with_partner,
+    ListType, Literal, Map, MapType, NestedField, PartnerAccessor, PrimitiveLiteral, PrimitiveType,
+    SchemaWithPartnerVisitor, Struct, StructType, Type, visit_struct_with_partner,
+    visit_type_with_partner,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -257,16 +261,15 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
                             "The partner is not a decimal128 array",
                         )
                     })?;
-                if let DataType::Decimal128(arrow_precision, arrow_scale) = array.data_type() {
-                    if *arrow_precision as u32 != *precision || *arrow_scale as u32 != *scale {
-                        return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "The precision or scale ({},{}) of arrow decimal128 array is not compatitable with iceberg decimal type ({},{})",
-                                arrow_precision, arrow_scale, precision, scale
-                            ),
-                        ));
-                    }
+                if let DataType::Decimal128(arrow_precision, arrow_scale) = array.data_type()
+                    && (*arrow_precision as u32 != *precision || *arrow_scale as u32 != *scale)
+                {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "The precision or scale ({arrow_precision},{arrow_scale}) of arrow decimal128 array is not compatible with iceberg decimal type ({precision},{scale})"
+                        ),
+                    ));
                 }
                 Ok(array.iter().map(|v| v.map(Literal::decimal)).collect())
             }
@@ -348,10 +351,10 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
                 } else if let Some(array) = partner.as_any().downcast_ref::<StringArray>() {
                     Ok(array.iter().map(|v| v.map(Literal::string)).collect())
                 } else {
-                    return Err(Error::new(
+                    Err(Error::new(
                         ErrorKind::DataInvalid,
                         "The partner is not a string array",
-                    ));
+                    ))
                 }
             }
             PrimitiveType::Uuid => {
@@ -395,7 +398,7 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
                 if array.value_length() != *len as i32 {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
-                        "The length of fixed size binary array is not compatitable with iceberg fixed type",
+                        "The length of fixed size binary array is not compatible with iceberg fixed type",
                     ));
                 }
                 Ok(array
@@ -415,21 +418,73 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
                         .map(|v| v.map(|v| Literal::binary(v.to_vec())))
                         .collect())
                 } else {
-                    return Err(Error::new(
+                    Err(Error::new(
                         ErrorKind::DataInvalid,
                         "The partner is not a binary array",
-                    ));
+                    ))
                 }
             }
         }
     }
 }
 
+/// Defines how Arrow fields are matched with Iceberg fields when converting data.
+///
+/// This enum provides two strategies for matching fields:
+/// - `Id`: Match fields by their ID, which is stored in Arrow field metadata.
+/// - `Name`: Match fields by their name, ignoring the field ID.
+///
+/// The ID matching mode is the default and preferred approach as it's more robust
+/// against schema evolution where field names might change but IDs remain stable.
+/// The name matching mode can be useful in scenarios where field IDs are not available
+/// or when working with systems that don't preserve field IDs.
+#[derive(Clone, Copy, Debug)]
+pub enum FieldMatchMode {
+    /// Match fields by their ID stored in Arrow field metadata
+    Id,
+    /// Match fields by their name, ignoring field IDs
+    Name,
+}
+
+impl FieldMatchMode {
+    /// Determines if an Arrow field matches an Iceberg field based on the matching mode.
+    pub fn match_field(&self, arrow_field: &FieldRef, iceberg_field: &NestedField) -> bool {
+        match self {
+            FieldMatchMode::Id => get_field_id_from_metadata(arrow_field)
+                .map(|id| id == iceberg_field.id)
+                .unwrap_or(false),
+            FieldMatchMode::Name => arrow_field.name() == &iceberg_field.name,
+        }
+    }
+}
+
 /// Partner type representing accessing and walking arrow arrays alongside iceberg schema
-pub struct ArrowArrayAccessor;
+pub struct ArrowArrayAccessor {
+    match_mode: FieldMatchMode,
+}
+
+impl ArrowArrayAccessor {
+    /// Creates a new instance of ArrowArrayAccessor with the default ID matching mode
+    pub fn new() -> Self {
+        Self {
+            match_mode: FieldMatchMode::Id,
+        }
+    }
+
+    /// Creates a new instance of ArrowArrayAccessor with the specified matching mode
+    pub fn new_with_match_mode(match_mode: FieldMatchMode) -> Self {
+        Self { match_mode }
+    }
+}
+
+impl Default for ArrowArrayAccessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl PartnerAccessor<ArrayRef> for ArrowArrayAccessor {
-    fn struct_parner<'a>(&self, schema_partner: &'a ArrayRef) -> Result<&'a ArrayRef> {
+    fn struct_partner<'a>(&self, schema_partner: &'a ArrayRef) -> Result<&'a ArrayRef> {
         if !matches!(schema_partner.data_type(), DataType::Struct(_)) {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -451,18 +506,16 @@ impl PartnerAccessor<ArrayRef> for ArrowArrayAccessor {
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::DataInvalid,
-                    "The struct partner is not a struct array",
+                    format!(
+                        "The struct partner is not a struct array, partner: {struct_partner:?}"
+                    ),
                 )
             })?;
 
         let field_pos = struct_array
             .fields()
             .iter()
-            .position(|arrow_field| {
-                get_field_id(arrow_field)
-                    .map(|id| id == field.id)
-                    .unwrap_or(false)
-            })
+            .position(|arrow_field| self.match_mode.match_field(arrow_field, field))
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::DataInvalid,
@@ -549,8 +602,289 @@ pub fn arrow_struct_to_literal(
         ty,
         struct_array,
         &mut ArrowArrayToIcebergStructConverter,
-        &ArrowArrayAccessor,
+        &ArrowArrayAccessor::new(),
     )
+}
+
+/// Convert arrow primitive array to iceberg primitive value array.
+/// This function will assume the schema of arrow struct array is the same as iceberg struct type.
+pub fn arrow_primitive_to_literal(
+    primitive_array: &ArrayRef,
+    ty: &Type,
+) -> Result<Vec<Option<Literal>>> {
+    visit_type_with_partner(
+        ty,
+        primitive_array,
+        &mut ArrowArrayToIcebergStructConverter,
+        &ArrowArrayAccessor::new(),
+    )
+}
+
+/// Create a single-element array from a primitive literal.
+///
+/// This is used for creating constant arrays (Run-End Encoded arrays) where we need
+/// a single value that represents all rows.
+pub(crate) fn create_primitive_array_single_element(
+    data_type: &DataType,
+    prim_lit: &Option<PrimitiveLiteral>,
+) -> Result<ArrayRef> {
+    match (data_type, prim_lit) {
+        (DataType::Boolean, Some(PrimitiveLiteral::Boolean(v))) => {
+            Ok(Arc::new(BooleanArray::from(vec![*v])))
+        }
+        (DataType::Boolean, None) => Ok(Arc::new(BooleanArray::from(vec![Option::<bool>::None]))),
+        (DataType::Int32, Some(PrimitiveLiteral::Int(v))) => {
+            Ok(Arc::new(Int32Array::from(vec![*v])))
+        }
+        (DataType::Int32, None) => Ok(Arc::new(Int32Array::from(vec![Option::<i32>::None]))),
+        (DataType::Date32, Some(PrimitiveLiteral::Int(v))) => {
+            Ok(Arc::new(Date32Array::from(vec![*v])))
+        }
+        (DataType::Date32, None) => Ok(Arc::new(Date32Array::from(vec![Option::<i32>::None]))),
+        (DataType::Int64, Some(PrimitiveLiteral::Long(v))) => {
+            Ok(Arc::new(Int64Array::from(vec![*v])))
+        }
+        (DataType::Int64, None) => Ok(Arc::new(Int64Array::from(vec![Option::<i64>::None]))),
+        (DataType::Float32, Some(PrimitiveLiteral::Float(v))) => {
+            Ok(Arc::new(Float32Array::from(vec![v.0])))
+        }
+        (DataType::Float32, None) => Ok(Arc::new(Float32Array::from(vec![Option::<f32>::None]))),
+        (DataType::Float64, Some(PrimitiveLiteral::Double(v))) => {
+            Ok(Arc::new(Float64Array::from(vec![v.0])))
+        }
+        (DataType::Float64, None) => Ok(Arc::new(Float64Array::from(vec![Option::<f64>::None]))),
+        (DataType::Utf8, Some(PrimitiveLiteral::String(v))) => {
+            Ok(Arc::new(StringArray::from(vec![v.as_str()])))
+        }
+        (DataType::Utf8, None) => Ok(Arc::new(StringArray::from(vec![Option::<&str>::None]))),
+        (DataType::Binary, Some(PrimitiveLiteral::Binary(v))) => {
+            Ok(Arc::new(BinaryArray::from_vec(vec![v.as_slice()])))
+        }
+        (DataType::Binary, None) => Ok(Arc::new(BinaryArray::from_opt_vec(vec![
+            Option::<&[u8]>::None,
+        ]))),
+        (DataType::Decimal128(precision, scale), Some(PrimitiveLiteral::Int128(v))) => {
+            let array = Decimal128Array::from(vec![{ *v }])
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Failed to create Decimal128Array with precision {precision} and scale {scale}: {e}"
+                        ),
+                    )
+                })?;
+            Ok(Arc::new(array))
+        }
+        (DataType::Decimal128(precision, scale), Some(PrimitiveLiteral::UInt128(v))) => {
+            let array = Decimal128Array::from(vec![*v as i128])
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Failed to create Decimal128Array with precision {precision} and scale {scale}: {e}"
+                        ),
+                    )
+                })?;
+            Ok(Arc::new(array))
+        }
+        (DataType::Decimal128(precision, scale), None) => {
+            let array = Decimal128Array::from(vec![Option::<i128>::None])
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Failed to create Decimal128Array with precision {precision} and scale {scale}: {e}"
+                        ),
+                    )
+                })?;
+            Ok(Arc::new(array))
+        }
+        (DataType::Struct(fields), None) => {
+            // Create a single-element StructArray with nulls
+            let null_arrays: Vec<ArrayRef> = fields
+                .iter()
+                .map(|f| {
+                    // Recursively create null arrays for struct fields
+                    // For primitive fields in structs, use simple null arrays (not REE within struct)
+                    match f.data_type() {
+                        DataType::Boolean => {
+                            Ok(Arc::new(BooleanArray::from(vec![Option::<bool>::None]))
+                                as ArrayRef)
+                        }
+                        DataType::Int32 | DataType::Date32 => {
+                            Ok(Arc::new(Int32Array::from(vec![Option::<i32>::None])) as ArrayRef)
+                        }
+                        DataType::Int64 => {
+                            Ok(Arc::new(Int64Array::from(vec![Option::<i64>::None])) as ArrayRef)
+                        }
+                        DataType::Float32 => {
+                            Ok(Arc::new(Float32Array::from(vec![Option::<f32>::None])) as ArrayRef)
+                        }
+                        DataType::Float64 => {
+                            Ok(Arc::new(Float64Array::from(vec![Option::<f64>::None])) as ArrayRef)
+                        }
+                        DataType::Utf8 => {
+                            Ok(Arc::new(StringArray::from(vec![Option::<&str>::None])) as ArrayRef)
+                        }
+                        DataType::Binary => {
+                            Ok(
+                                Arc::new(BinaryArray::from_opt_vec(vec![Option::<&[u8]>::None]))
+                                    as ArrayRef,
+                            )
+                        }
+                        _ => Err(Error::new(
+                            ErrorKind::Unexpected,
+                            format!("Unsupported struct field type: {:?}", f.data_type()),
+                        )),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(arrow_array::StructArray::new(
+                fields.clone(),
+                null_arrays,
+                Some(arrow_buffer::NullBuffer::new_null(1)),
+            )))
+        }
+        _ => Err(Error::new(
+            ErrorKind::Unexpected,
+            format!("Unsupported constant type combination: {data_type:?} with {prim_lit:?}"),
+        )),
+    }
+}
+
+/// Create a repeated array from a primitive literal for a given number of rows.
+///
+/// This is used for creating non-constant arrays where we need the same value
+/// repeated for each row.
+pub(crate) fn create_primitive_array_repeated(
+    data_type: &DataType,
+    prim_lit: &Option<PrimitiveLiteral>,
+    num_rows: usize,
+) -> Result<ArrayRef> {
+    Ok(match (data_type, prim_lit) {
+        (DataType::Boolean, Some(PrimitiveLiteral::Boolean(value))) => {
+            Arc::new(BooleanArray::from(vec![*value; num_rows]))
+        }
+        (DataType::Boolean, None) => {
+            let vals: Vec<Option<bool>> = vec![None; num_rows];
+            Arc::new(BooleanArray::from(vals))
+        }
+        (DataType::Int32, Some(PrimitiveLiteral::Int(value))) => {
+            Arc::new(Int32Array::from(vec![*value; num_rows]))
+        }
+        (DataType::Int32, None) => {
+            let vals: Vec<Option<i32>> = vec![None; num_rows];
+            Arc::new(Int32Array::from(vals))
+        }
+        (DataType::Date32, Some(PrimitiveLiteral::Int(value))) => {
+            Arc::new(Date32Array::from(vec![*value; num_rows]))
+        }
+        (DataType::Date32, None) => {
+            let vals: Vec<Option<i32>> = vec![None; num_rows];
+            Arc::new(Date32Array::from(vals))
+        }
+        (DataType::Int64, Some(PrimitiveLiteral::Long(value))) => {
+            Arc::new(Int64Array::from(vec![*value; num_rows]))
+        }
+        (DataType::Int64, None) => {
+            let vals: Vec<Option<i64>> = vec![None; num_rows];
+            Arc::new(Int64Array::from(vals))
+        }
+        (DataType::Float32, Some(PrimitiveLiteral::Float(value))) => {
+            Arc::new(Float32Array::from(vec![value.0; num_rows]))
+        }
+        (DataType::Float32, None) => {
+            let vals: Vec<Option<f32>> = vec![None; num_rows];
+            Arc::new(Float32Array::from(vals))
+        }
+        (DataType::Float64, Some(PrimitiveLiteral::Double(value))) => {
+            Arc::new(Float64Array::from(vec![value.0; num_rows]))
+        }
+        (DataType::Float64, None) => {
+            let vals: Vec<Option<f64>> = vec![None; num_rows];
+            Arc::new(Float64Array::from(vals))
+        }
+        (DataType::Utf8, Some(PrimitiveLiteral::String(value))) => {
+            Arc::new(StringArray::from(vec![value.clone(); num_rows]))
+        }
+        (DataType::Utf8, None) => {
+            let vals: Vec<Option<String>> = vec![None; num_rows];
+            Arc::new(StringArray::from(vals))
+        }
+        (DataType::Binary, Some(PrimitiveLiteral::Binary(value))) => {
+            Arc::new(BinaryArray::from_vec(vec![value; num_rows]))
+        }
+        (DataType::Binary, None) => {
+            let vals: Vec<Option<&[u8]>> = vec![None; num_rows];
+            Arc::new(BinaryArray::from_opt_vec(vals))
+        }
+        (DataType::Decimal128(precision, scale), Some(PrimitiveLiteral::Int128(value))) => {
+            Arc::new(
+                Decimal128Array::from(vec![*value; num_rows])
+                    .with_precision_and_scale(*precision, *scale)
+                    .map_err(|e| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Failed to create Decimal128Array with precision {precision} and scale {scale}: {e}"
+                            ),
+                        )
+                    })?,
+            )
+        }
+        (DataType::Decimal128(precision, scale), Some(PrimitiveLiteral::UInt128(value))) => {
+            Arc::new(
+                Decimal128Array::from(vec![*value as i128; num_rows])
+                    .with_precision_and_scale(*precision, *scale)
+                    .map_err(|e| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Failed to create Decimal128Array with precision {precision} and scale {scale}: {e}"
+                            ),
+                        )
+                    })?,
+            )
+        }
+        (DataType::Decimal128(precision, scale), None) => {
+            let vals: Vec<Option<i128>> = vec![None; num_rows];
+            Arc::new(
+                Decimal128Array::from(vals)
+                    .with_precision_and_scale(*precision, *scale)
+                    .map_err(|e| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Failed to create Decimal128Array with precision {precision} and scale {scale}: {e}"
+                            ),
+                        )
+                    })?,
+            )
+        }
+        (DataType::Struct(fields), None) => {
+            // Create a StructArray filled with nulls
+            let null_arrays: Vec<ArrayRef> = fields
+                .iter()
+                .map(|field| create_primitive_array_repeated(field.data_type(), &None, num_rows))
+                .collect::<Result<Vec<_>>>()?;
+
+            Arc::new(StructArray::new(
+                fields.clone(),
+                null_arrays,
+                Some(NullBuffer::new_null(num_rows)),
+            ))
+        }
+        (DataType::Null, _) => Arc::new(arrow_array::NullArray::new(num_rows)),
+        (dt, _) => {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("unexpected target column type {dt}"),
+            ));
+        }
+    })
 }
 
 #[cfg(test)]
@@ -900,6 +1234,183 @@ mod test {
     }
 
     #[test]
+    fn test_find_field_by_id() {
+        // Create Arrow arrays for the nested structure
+        let field_a_array = Int32Array::from(vec![Some(42), Some(43), None]);
+        let field_b_array = StringArray::from(vec![Some("value1"), Some("value2"), None]);
+
+        // Create the nested struct array with field IDs in metadata
+        let nested_struct_array =
+            Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(Field::new("field_a", DataType::Int32, true).with_metadata(
+                        HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+                    )),
+                    Arc::new(field_a_array) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("field_b", DataType::Utf8, true).with_metadata(
+                        HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
+                    )),
+                    Arc::new(field_b_array) as ArrayRef,
+                ),
+            ])) as ArrayRef;
+
+        let field_c_array = Int32Array::from(vec![Some(100), Some(200), None]);
+
+        // Create the top-level struct array with field IDs in metadata
+        let struct_array = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(
+                    Field::new(
+                        "nested_struct",
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("field_a", DataType::Int32, true).with_metadata(
+                                HashMap::from([(
+                                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                                    "1".to_string(),
+                                )]),
+                            ),
+                            Field::new("field_b", DataType::Utf8, true).with_metadata(
+                                HashMap::from([(
+                                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                                    "2".to_string(),
+                                )]),
+                            ),
+                        ])),
+                        true,
+                    )
+                    .with_metadata(HashMap::from([(
+                        PARQUET_FIELD_ID_META_KEY.to_string(),
+                        "3".to_string(),
+                    )])),
+                ),
+                nested_struct_array,
+            ),
+            (
+                Arc::new(Field::new("field_c", DataType::Int32, true).with_metadata(
+                    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "4".to_string())]),
+                )),
+                Arc::new(field_c_array) as ArrayRef,
+            ),
+        ])) as ArrayRef;
+
+        // Create an ArrowArrayAccessor with ID matching mode
+        let accessor = ArrowArrayAccessor::new_with_match_mode(FieldMatchMode::Id);
+
+        // Test finding fields by ID
+        let nested_field = NestedField::optional(
+            3,
+            "nested_struct",
+            Type::Struct(StructType::new(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "field_a",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "field_b",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])),
+        );
+        let nested_partner = accessor
+            .field_partner(&struct_array, &nested_field)
+            .unwrap();
+
+        // Verify we can access the nested field
+        let field_a = NestedField::optional(1, "field_a", Type::Primitive(PrimitiveType::Int));
+        let field_a_partner = accessor.field_partner(nested_partner, &field_a).unwrap();
+
+        // Verify the field has the expected value
+        let int_array = field_a_partner
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(int_array.value(0), 42);
+        assert_eq!(int_array.value(1), 43);
+        assert!(int_array.is_null(2));
+    }
+
+    #[test]
+    fn test_find_field_by_name() {
+        // Create Arrow arrays for the nested structure
+        let field_a_array = Int32Array::from(vec![Some(42), Some(43), None]);
+        let field_b_array = StringArray::from(vec![Some("value1"), Some("value2"), None]);
+
+        // Create the nested struct array WITHOUT field IDs in metadata
+        let nested_struct_array = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("field_a", DataType::Int32, true)),
+                Arc::new(field_a_array) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("field_b", DataType::Utf8, true)),
+                Arc::new(field_b_array) as ArrayRef,
+            ),
+        ])) as ArrayRef;
+
+        let field_c_array = Int32Array::from(vec![Some(100), Some(200), None]);
+
+        // Create the top-level struct array WITHOUT field IDs in metadata
+        let struct_array = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new(
+                    "nested_struct",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("field_a", DataType::Int32, true),
+                        Field::new("field_b", DataType::Utf8, true),
+                    ])),
+                    true,
+                )),
+                nested_struct_array,
+            ),
+            (
+                Arc::new(Field::new("field_c", DataType::Int32, true)),
+                Arc::new(field_c_array) as ArrayRef,
+            ),
+        ])) as ArrayRef;
+
+        // Create an ArrowArrayAccessor with Name matching mode
+        let accessor = ArrowArrayAccessor::new_with_match_mode(FieldMatchMode::Name);
+
+        // Test finding fields by name
+        let nested_field = NestedField::optional(
+            3,
+            "nested_struct",
+            Type::Struct(StructType::new(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "field_a",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "field_b",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])),
+        );
+        let nested_partner = accessor
+            .field_partner(&struct_array, &nested_field)
+            .unwrap();
+
+        // Verify we can access the nested field by name
+        let field_a = NestedField::optional(1, "field_a", Type::Primitive(PrimitiveType::Int));
+        let field_a_partner = accessor.field_partner(nested_partner, &field_a).unwrap();
+
+        // Verify the field has the expected value
+        let int_array = field_a_partner
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(int_array.value(0), 42);
+        assert_eq!(int_array.value(1), 43);
+        assert!(int_array.is_null(2));
+    }
+
+    #[test]
     fn test_complex_nested() {
         // complex nested type for test
         // <
@@ -1225,5 +1736,49 @@ mod test {
                 ])),
             ]))),
         ]);
+    }
+
+    #[test]
+    fn test_create_decimal_array_respects_precision() {
+        // Decimal128Array::from() uses Arrow's default precision (38) instead of the
+        // target precision, causing RecordBatch construction to fail when schemas don't match.
+        let target_precision = 18u8;
+        let target_scale = 10i8;
+        let target_type = DataType::Decimal128(target_precision, target_scale);
+        let value = PrimitiveLiteral::Int128(10000000000);
+
+        let array = create_primitive_array_single_element(&target_type, &Some(value))
+            .expect("Failed to create decimal array");
+
+        match array.data_type() {
+            DataType::Decimal128(precision, scale) => {
+                assert_eq!(*precision, target_precision);
+                assert_eq!(*scale, target_scale);
+            }
+            other => panic!("Expected Decimal128, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_create_decimal_array_repeated_respects_precision() {
+        // Ensure repeated arrays also respect target precision, not Arrow's default.
+        let target_precision = 18u8;
+        let target_scale = 10i8;
+        let target_type = DataType::Decimal128(target_precision, target_scale);
+        let value = PrimitiveLiteral::Int128(10000000000);
+        let num_rows = 5;
+
+        let array = create_primitive_array_repeated(&target_type, &Some(value), num_rows)
+            .expect("Failed to create repeated decimal array");
+
+        match array.data_type() {
+            DataType::Decimal128(precision, scale) => {
+                assert_eq!(*precision, target_precision);
+                assert_eq!(*scale, target_scale);
+            }
+            other => panic!("Expected Decimal128, got {other:?}"),
+        }
+
+        assert_eq!(array.len(), num_rows);
     }
 }
