@@ -547,7 +547,24 @@ impl Catalog for GlueCatalog {
             .table_input(glue_table);
         let builder = with_catalog_id!(builder, self.config);
 
-        builder.send().await.map_err(from_aws_sdk_error)?;
+        builder.send().await.map_err(|e| {
+            let error = e.into_service_error();
+            match error {
+                CreateTableError::EntityNotFoundException(_) => Error::new(
+                    ErrorKind::NamespaceNotFound,
+                    format!("Database {db_name} does not exist"),
+                ),
+                CreateTableError::AlreadyExistsException(_) => Error::new(
+                    ErrorKind::TableAlreadyExists,
+                    format!("Table {db_name}.{table_name} already exists"),
+                ),
+                _ => Error::new(
+                    ErrorKind::Unexpected,
+                    "Operation failed for hitting aws sdk error".to_string(),
+                ),
+            }
+            .with_source(anyhow!("aws sdk error: {error:?}"))
+        })?;
 
         Table::builder()
             .file_io(self.file_io())
