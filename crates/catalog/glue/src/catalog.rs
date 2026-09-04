@@ -209,7 +209,7 @@ impl GlueCatalog {
     /// - Failure to retrieve the table from the Glue Catalog.
     /// - Absence of metadata location information in the table's properties.
     /// - Issues reading or deserializing the table's metadata file.
-    async fn load_table_with_version_id(
+    pub async fn load_table_with_version_id(
         &self,
         table: &TableIdent,
     ) -> Result<(Table, Option<String>)> {
@@ -251,6 +251,67 @@ impl GlueCatalog {
             .build()?;
 
         Ok((table, version_id))
+    }
+
+    /// Persist a table commit using a table and Glue version id that the caller already loaded.
+    pub async fn update_table_with_loaded_table(
+        &self,
+        current_table: Table,
+        current_version_id: Option<String>,
+        commit: TableCommit,
+    ) -> Result<Table> {
+        let table_ident = commit.identifier().clone();
+        let table_namespace = validate_namespace(table_ident.namespace())?;
+        let current_metadata_location = current_table.metadata_location_result()?.to_string();
+
+        let staged_table = commit.apply(current_table)?;
+        let staged_metadata_location = staged_table.metadata_location_result()?;
+
+        staged_table
+            .metadata()
+            .write_to(staged_table.file_io(), staged_metadata_location)
+            .await?;
+
+        let mut builder = self
+            .client
+            .0
+            .update_table()
+            .database_name(table_namespace)
+            .set_skip_archive(Some(true))
+            .table_input(convert_to_glue_table(
+                table_ident.name(),
+                staged_metadata_location.to_string(),
+                staged_table.metadata(),
+                staged_table.metadata().properties(),
+                Some(current_metadata_location),
+            )?);
+
+        if let Some(version_id) = current_version_id {
+            builder = builder.version_id(version_id);
+        }
+
+        let builder = with_catalog_id!(builder, self.config);
+        let _ = builder.send().await.map_err(|e| {
+            let error = e.into_service_error();
+            match error {
+                UpdateTableError::EntityNotFoundException(_) => Error::new(
+                    ErrorKind::TableNotFound,
+                    format!("Table {table_ident} is not found"),
+                ),
+                UpdateTableError::ConcurrentModificationException(_) => Error::new(
+                    ErrorKind::CatalogCommitConflicts,
+                    format!("Commit failed for table: {table_ident}"),
+                )
+                .with_retryable(true),
+                _ => Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Operation failed for table: {table_ident} for hitting aws sdk error"),
+                ),
+            }
+            .with_source(anyhow!("aws sdk error: {error:?}"))
+        })?;
+
+        Ok(staged_table)
     }
 }
 
@@ -799,62 +860,9 @@ impl Catalog for GlueCatalog {
 
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
         let table_ident = commit.identifier().clone();
-        let table_namespace = validate_namespace(table_ident.namespace())?;
-
         let (current_table, current_version_id) =
             self.load_table_with_version_id(&table_ident).await?;
-        let current_metadata_location = current_table.metadata_location_result()?.to_string();
-
-        let staged_table = commit.apply(current_table)?;
-        let staged_metadata_location = staged_table.metadata_location_result()?;
-
-        // Write new metadata
-        staged_table
-            .metadata()
-            .write_to(staged_table.file_io(), staged_metadata_location)
-            .await?;
-
-        // Persist staged table to Glue with optimistic locking
-        let mut builder = self
-            .client
-            .0
-            .update_table()
-            .database_name(table_namespace)
-            .set_skip_archive(Some(true)) // todo make this configurable
-            .table_input(convert_to_glue_table(
-                table_ident.name(),
-                staged_metadata_location.to_string(),
-                staged_table.metadata(),
-                staged_table.metadata().properties(),
-                Some(current_metadata_location),
-            )?);
-
-        // Add VersionId for optimistic locking
-        if let Some(version_id) = current_version_id {
-            builder = builder.version_id(version_id);
-        }
-
-        let builder = with_catalog_id!(builder, self.config);
-        let _ = builder.send().await.map_err(|e| {
-            let error = e.into_service_error();
-            match error {
-                UpdateTableError::EntityNotFoundException(_) => Error::new(
-                    ErrorKind::TableNotFound,
-                    format!("Table {table_ident} is not found"),
-                ),
-                UpdateTableError::ConcurrentModificationException(_) => Error::new(
-                    ErrorKind::CatalogCommitConflicts,
-                    format!("Commit failed for table: {table_ident}"),
-                )
-                .with_retryable(true),
-                _ => Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Operation failed for table: {table_ident} for hitting aws sdk error"),
-                ),
-            }
-            .with_source(anyhow!("aws sdk error: {error:?}"))
-        })?;
-
-        Ok(staged_table)
+        self.update_table_with_loaded_table(current_table, current_version_id, commit)
+            .await
     }
 }

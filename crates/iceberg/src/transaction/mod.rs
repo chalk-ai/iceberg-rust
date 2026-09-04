@@ -261,16 +261,7 @@ impl Transaction {
             .build())
     }
 
-    async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
-        let refreshed = catalog.load_table(self.table.identifier()).await?;
-
-        if self.table.metadata() != refreshed.metadata()
-            || self.table.metadata_location() != refreshed.metadata_location()
-        {
-            // current base is stale, use refreshed as base and re-apply transaction actions
-            self.table = refreshed.clone();
-        }
-
+    async fn build_table_commit_from_current_base(&self) -> Result<TableCommit> {
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
@@ -286,13 +277,32 @@ impl Transaction {
             )?;
         }
 
-        let table_commit = TableCommit::builder()
+        Ok(TableCommit::builder()
             .ident(self.table.identifier().to_owned())
             .updates(existing_updates)
             .requirements(existing_requirements)
-            .build();
+            .build())
+    }
 
+    async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
+        let refreshed = catalog.load_table(self.table.identifier()).await?;
+
+        if self.table.metadata() != refreshed.metadata()
+            || self.table.metadata_location() != refreshed.metadata_location()
+        {
+            // Current base is stale, so re-apply the transaction actions against the refreshed
+            // table before constructing the commit.
+            self.table = refreshed.clone();
+        }
+
+        let table_commit = self.build_table_commit_from_current_base().await?;
         catalog.update_table(table_commit).await
+    }
+
+    /// Build a [`TableCommit`] from the transaction's current base table without refreshing it
+    /// from the catalog first.
+    pub async fn into_table_commit_no_refresh(self) -> Result<TableCommit> {
+        self.build_table_commit_from_current_base().await
     }
 }
 
