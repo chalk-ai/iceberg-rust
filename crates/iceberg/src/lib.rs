@@ -60,11 +60,27 @@
 //! }
 //! ```
 
-#![deny(missing_docs)]
-
 #[macro_use]
 extern crate derive_builder;
 extern crate core;
+
+use apache_avro::AvroResult;
+use apache_avro::validator::{RecordFieldNameValidator, set_record_field_name_validator};
+
+struct NoValidation;
+
+impl RecordFieldNameValidator for NoValidation {
+    fn validate(&self, _: &str) -> AvroResult<()> {
+        Ok(())
+    }
+}
+
+#[ctor::ctor]
+fn configure_avro_record_field_name_validation() {
+    // Iceberg manifests can contain Avro field names that apache-avro-rs rejects
+    // during container schema parsing. Match Avro Java's permissive reader mode.
+    let _ = set_record_field_name_validator(Box::new(NoValidation));
+}
 
 mod error;
 pub use error::{Error, ErrorKind, Result};

@@ -272,6 +272,7 @@ impl Display for TableIdent {
 
 /// TableCreation represents the creation of a table in the catalog.
 #[derive(Debug, TypedBuilder)]
+#[builder(build_method(vis = "pub"))]
 pub struct TableCreation {
     /// The name of the table.
     pub name: String,
@@ -302,7 +303,7 @@ pub struct TableCreation {
 /// [`TableCommit`] directly.
 /// Users are supposed to use [`crate::transaction::Transaction`] to update table.
 #[derive(Debug, TypedBuilder)]
-#[builder(build_method(vis = "pub(crate)"))]
+#[builder(build_method(vis = "pub"))]
 pub struct TableCommit {
     /// The table ident.
     ident: TableIdent,

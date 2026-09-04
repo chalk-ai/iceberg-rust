@@ -27,7 +27,7 @@ use crate::writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder};
 use crate::{Error, ErrorKind, Result};
 
 /// Builder for `DataFileWriter`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DataFileWriterBuilder<B: FileWriterBuilder, L: LocationGenerator, F: FileNameGenerator> {
     inner: RollingFileWriterBuilder<B, L, F>,
 }

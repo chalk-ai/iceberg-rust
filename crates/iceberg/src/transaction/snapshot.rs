@@ -83,8 +83,13 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// - **Delete operations**: May exclude manifests for partitions being deleted
     fn existing_manifest(
         &self,
-        snapshot_produce: &SnapshotProducer<'_>,
+        snapshot_produce: &mut SnapshotProducer<'_>,
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
+
+    /// Data files being removed in this operation.
+    fn removed_data_files(&self) -> &[DataFile] {
+        &[]
+    }
 }
 
 pub(crate) struct DefaultManifestProcess;
@@ -114,6 +119,7 @@ pub(crate) struct SnapshotProducer<'a> {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    added_delete_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -135,8 +141,18 @@ impl<'a> SnapshotProducer<'a> {
             key_metadata,
             snapshot_properties,
             added_data_files,
+            added_delete_files: vec![],
             manifest_counter: (0..),
         }
+    }
+
+    pub(crate) fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+
+    pub(crate) fn with_delete_files(mut self, files: Vec<DataFile>) -> Self {
+        self.added_delete_files = files;
+        self
     }
 
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
@@ -223,7 +239,10 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_id
     }
 
-    fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
+    pub(crate) fn new_manifest_writer(
+        &mut self,
+        content: ManifestContentType,
+    ) -> Result<ManifestWriter> {
         let new_manifest_path = format!(
             "{}/{}/{}-m{}.{}",
             self.table.metadata().location(),
@@ -288,19 +307,25 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
-    // Write manifest file for added data files and return the ManifestFile for ManifestList.
-    async fn write_added_manifest(&mut self) -> Result<ManifestFile> {
-        let added_data_files = std::mem::take(&mut self.added_data_files);
-        if added_data_files.is_empty() {
+    // Write manifest file for added data or delete files and return the ManifestFile for ManifestList.
+    async fn write_added_manifest(
+        &mut self,
+        content_type: ManifestContentType,
+    ) -> Result<ManifestFile> {
+        let added_files = match content_type {
+            ManifestContentType::Data => std::mem::take(&mut self.added_data_files),
+            ManifestContentType::Deletes => std::mem::take(&mut self.added_delete_files),
+        };
+        if added_files.is_empty() {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files found when write an added manifest file",
+                "No added files found when writing an added manifest file",
             ));
         }
 
         let snapshot_id = self.snapshot_id;
         let format_version = self.table.metadata().format_version();
-        let manifest_entries = added_data_files.into_iter().map(|data_file| {
+        let manifest_entries = added_files.into_iter().map(|data_file| {
             let builder = ManifestEntry::builder()
                 .status(crate::spec::ManifestStatus::Added)
                 .data_file(data_file);
@@ -312,7 +337,7 @@ impl<'a> SnapshotProducer<'a> {
                 builder.build()
             }
         });
-        let mut writer = self.new_manifest_writer(ManifestContentType::Data)?;
+        let mut writer = self.new_manifest_writer(content_type)?;
         for entry in manifest_entries {
             writer.add_entry(entry)?;
         }
@@ -329,10 +354,14 @@ impl<'a> SnapshotProducer<'a> {
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
-        if self.added_data_files.is_empty() && self.snapshot_properties.is_empty() {
+        if self.added_data_files.is_empty()
+            && self.added_delete_files.is_empty()
+            && snapshot_produce_operation.removed_data_files().is_empty()
+            && self.snapshot_properties.is_empty()
+        {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files or added snapshot properties found when write a manifest file",
+                "No added data files, delete files, removed files, or added snapshot properties found when writing a manifest file",
             ));
         }
 
@@ -341,12 +370,16 @@ impl<'a> SnapshotProducer<'a> {
 
         // Process added entries.
         if !self.added_data_files.is_empty() {
-            let added_manifest = self.write_added_manifest().await?;
+            let added_manifest = self.write_added_manifest(ManifestContentType::Data).await?;
             manifest_files.push(added_manifest);
         }
 
-        // # TODO
-        // Support process delete entries.
+        if !self.added_delete_files.is_empty() {
+            let delete_manifest = self
+                .write_added_manifest(ManifestContentType::Deletes)
+                .await?;
+            manifest_files.push(delete_manifest);
+        }
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
         Ok(manifest_files)
@@ -377,6 +410,14 @@ impl<'a> SnapshotProducer<'a> {
 
         for data_file in &self.added_data_files {
             summary_collector.add_file(
+                data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+
+        for data_file in snapshot_produce_operation.removed_data_files() {
+            summary_collector.remove_file(
                 data_file,
                 table_metadata.current_schema().clone(),
                 table_metadata.default_partition_spec().clone(),

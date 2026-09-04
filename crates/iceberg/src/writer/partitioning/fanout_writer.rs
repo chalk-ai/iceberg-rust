@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 
 use crate::spec::{PartitionKey, Struct};
 use crate::writer::partitioning::PartitioningWriter;
@@ -49,6 +50,13 @@ where
     partition_writers: HashMap<Struct, B::R>,
     output: Vec<<O as IntoIterator>::Item>,
     _phantom: PhantomData<I>,
+}
+
+fn fanout_close_concurrency() -> usize {
+    std::env::var("CHALK_ICEBERG_FANOUT_CLOSE_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32)
 }
 
 impl<B, I, O> FanoutWriter<B, I, O>
@@ -87,6 +95,27 @@ where
                     "Failed to get partition writer after creation",
                 )
             })
+    }
+
+    /// Close all partition writers with bounded concurrency, returning data files and per-partition durations.
+    pub async fn close_collecting_durations(mut self) -> Result<(O, Vec<std::time::Duration>)> {
+        let concurrency = fanout_close_concurrency();
+        let mut durations = Vec::new();
+        let mut stream = futures::stream::iter(self.partition_writers.into_values())
+            .map(|mut writer| async move {
+                let start = std::time::Instant::now();
+                let files = writer.close().await?;
+                Ok::<_, crate::Error>((files, start.elapsed()))
+            })
+            .buffer_unordered(concurrency);
+
+        while let Some(result) = stream.next().await {
+            let (files, duration) = result?;
+            self.output.extend(files);
+            durations.push(duration);
+        }
+
+        Ok((O::from_iter(self.output), durations))
     }
 }
 

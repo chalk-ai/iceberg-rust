@@ -54,6 +54,9 @@ mod action;
 
 pub use action::*;
 mod append;
+mod overwrite;
+mod partition_spec;
+mod row_delta;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -61,16 +64,20 @@ mod update_properties;
 mod update_statistics;
 mod upgrade_format_version;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
 
 use crate::error::Result;
-use crate::spec::TableProperties;
+use crate::spec::{TableProperties, UnboundPartitionSpec};
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
+use crate::transaction::overwrite::OverwriteAction;
+use crate::transaction::partition_spec::ReplacePartitionSpecAction;
+use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -141,9 +148,27 @@ impl Transaction {
         FastAppendAction::new()
     }
 
+    /// Creates a row delta action for row-level modifications.
+    pub fn row_delta(&self) -> RowDeltaAction {
+        RowDeltaAction::new()
+    }
+
+    /// Creates an overwrite action for replacing data files.
+    pub fn overwrite(&self) -> OverwriteAction {
+        OverwriteAction::new()
+    }
+
     /// Creates replace sort order action.
     pub fn replace_sort_order(&self) -> ReplaceSortOrderAction {
         ReplaceSortOrderAction::new()
+    }
+
+    /// Creates replace partition spec action.
+    pub fn replace_partition_spec(
+        &self,
+        partition_spec: UnboundPartitionSpec,
+    ) -> ReplacePartitionSpecAction {
+        ReplacePartitionSpecAction::new(partition_spec)
     }
 
     /// Set the location of table
@@ -154,6 +179,15 @@ impl Transaction {
     /// Update the statistics of table
     pub fn update_statistics(&self) -> UpdateStatisticsAction {
         UpdateStatisticsAction::new()
+    }
+
+    /// Commit transaction once, with no internal retry.
+    pub async fn commit_once(self, catalog: &dyn Catalog) -> Result<Table> {
+        if self.actions.is_empty() {
+            return Ok(self.table);
+        }
+        let mut tx = self;
+        tx.do_commit(catalog).await
     }
 
     /// Commit transaction.
@@ -171,8 +205,19 @@ impl Transaction {
         let backoff = Self::build_backoff(table_props)?;
         let tx = self;
 
-        (|mut tx: Transaction| async {
+        let retry_count = Arc::new(AtomicUsize::new(0));
+        let error_kinds: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let result = (|mut tx: Transaction| async {
             let result = tx.do_commit(catalog).await;
+            if let Err(ref e) = result
+                && e.retryable()
+            {
+                retry_count.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut kinds) = error_kinds.lock() {
+                    kinds.push(format!("{:?}", e.kind()));
+                }
+            }
             (tx, result)
         })
         .retry(backoff)
@@ -180,7 +225,28 @@ impl Transaction {
         .context(tx)
         .when(|e| e.retryable())
         .await
-        .1
+        .1;
+
+        let attempts = retry_count.load(Ordering::SeqCst);
+        let error_kinds_list = error_kinds.lock().unwrap().join(",");
+
+        match result {
+            Ok(table) => {
+                let mut table_with_retries = table.with_retry_attempts(attempts);
+                if attempts > 0 && !error_kinds_list.is_empty() {
+                    table_with_retries =
+                        table_with_retries.with_retry_error_kinds(error_kinds_list);
+                }
+                Ok(table_with_retries)
+            }
+            Err(e) => {
+                let mut err = e.with_context("retry_attempts", attempts.to_string());
+                if !error_kinds_list.is_empty() {
+                    err = err.with_context("retry_error_kinds", error_kinds_list);
+                }
+                Err(err)
+            }
+        }
     }
 
     fn build_backoff(props: TableProperties) -> Result<ExponentialBackoff> {
@@ -195,16 +261,7 @@ impl Transaction {
             .build())
     }
 
-    async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
-        let refreshed = catalog.load_table(self.table.identifier()).await?;
-
-        if self.table.metadata() != refreshed.metadata()
-            || self.table.metadata_location() != refreshed.metadata_location()
-        {
-            // current base is stale, use refreshed as base and re-apply transaction actions
-            self.table = refreshed.clone();
-        }
-
+    async fn build_table_commit_from_current_base(&self) -> Result<TableCommit> {
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
@@ -220,13 +277,32 @@ impl Transaction {
             )?;
         }
 
-        let table_commit = TableCommit::builder()
+        Ok(TableCommit::builder()
             .ident(self.table.identifier().to_owned())
             .updates(existing_updates)
             .requirements(existing_requirements)
-            .build();
+            .build())
+    }
 
+    async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
+        let refreshed = catalog.load_table(self.table.identifier()).await?;
+
+        if self.table.metadata() != refreshed.metadata()
+            || self.table.metadata_location() != refreshed.metadata_location()
+        {
+            // Current base is stale, so re-apply the transaction actions against the refreshed
+            // table before constructing the commit.
+            self.table = refreshed.clone();
+        }
+
+        let table_commit = self.build_table_commit_from_current_base().await?;
         catalog.update_table(table_commit).await
+    }
+
+    /// Build a [`TableCommit`] from the transaction's current base table without refreshing it
+    /// from the catalog first.
+    pub async fn into_table_commit_no_refresh(self) -> Result<TableCommit> {
+        self.build_table_commit_from_current_base().await
     }
 }
 
