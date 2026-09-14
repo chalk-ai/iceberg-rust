@@ -16,27 +16,15 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::ops::Deref;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-use futures::StreamExt;
-use futures::channel::mpsc::{Sender, channel};
-use tokio::sync::Notify;
-
-use crate::runtime::spawn;
 use crate::scan::{DeleteFileContext, FileScanTaskDeleteFile};
 use crate::spec::{DataContentType, DataFile, Struct};
 
 /// Index of delete files
 #[derive(Debug, Clone)]
 pub(crate) struct DeleteFileIndex {
-    state: Arc<RwLock<DeleteFileIndexState>>,
-}
-
-#[derive(Debug)]
-enum DeleteFileIndexState {
-    Populating(Arc<Notify>),
-    Populated(PopulatedDeleteFileIndex),
+    index: Arc<PopulatedDeleteFileIndex>,
 }
 
 #[derive(Debug)]
@@ -52,60 +40,20 @@ struct PopulatedDeleteFileIndex {
 }
 
 impl DeleteFileIndex {
-    /// create a new `DeleteFileIndex` along with the sender that populates it with delete files
-    pub(crate) fn new() -> (DeleteFileIndex, Sender<DeleteFileContext>) {
-        // TODO: what should the channel limit be?
-        let (tx, rx) = channel(10);
-        let notify = Arc::new(Notify::new());
-        let state = Arc::new(RwLock::new(DeleteFileIndexState::Populating(
-            notify.clone(),
-        )));
-        let delete_file_stream = rx.boxed();
-
-        spawn({
-            let state = state.clone();
-            async move {
-                let delete_files: Vec<DeleteFileContext> =
-                    delete_file_stream.collect::<Vec<_>>().await;
-
-                let populated_delete_file_index = PopulatedDeleteFileIndex::new(delete_files);
-
-                {
-                    let mut guard = state.write().unwrap();
-                    *guard = DeleteFileIndexState::Populated(populated_delete_file_index);
-                }
-                notify.notify_waiters();
-            }
-        });
-
-        (DeleteFileIndex { state }, tx)
+    /// Create a new index from the complete set of delete file contexts.
+    pub(crate) fn new(delete_files: Vec<DeleteFileContext>) -> DeleteFileIndex {
+        DeleteFileIndex {
+            index: Arc::new(PopulatedDeleteFileIndex::new(delete_files)),
+        }
     }
 
     /// Gets all the delete files that apply to the specified data file.
-    pub(crate) async fn get_deletes_for_data_file(
+    pub(crate) fn get_deletes_for_data_file(
         &self,
         data_file: &DataFile,
         seq_num: Option<i64>,
     ) -> Vec<FileScanTaskDeleteFile> {
-        let notifier = {
-            let guard = self.state.read().unwrap();
-            match *guard {
-                DeleteFileIndexState::Populating(ref notifier) => notifier.clone(),
-                DeleteFileIndexState::Populated(ref index) => {
-                    return index.get_deletes_for_data_file(data_file, seq_num);
-                }
-            }
-        };
-
-        notifier.notified().await;
-
-        let guard = self.state.read().unwrap();
-        match guard.deref() {
-            DeleteFileIndexState::Populated(index) => {
-                index.get_deletes_for_data_file(data_file, seq_num)
-            }
-            _ => unreachable!("Cannot be any other state than loaded"),
-        }
+        self.index.get_deletes_for_data_file(data_file, seq_num)
     }
 }
 

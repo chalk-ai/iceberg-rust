@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::Result;
 use crate::expr::BoundPredicate;
 use crate::spec::{
-    DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
-    SchemaRef, Struct,
+    DataContentType, DataFile, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec,
+    Schema, SchemaRef, Struct,
 };
 
 /// A stream of [`FileScanTask`].
@@ -107,6 +107,17 @@ pub struct FileScanTask {
 
     /// Whether this scan task should treat column names as case-sensitive when binding predicates.
     pub case_sensitive: bool,
+
+    /// Full data file metadata from the manifest.
+    ///
+    /// This is kept for in-memory consumers that need to reapply predicate pruning or
+    /// build overwrite commits from planned tasks without rereading manifests.
+    #[serde(skip)]
+    pub data_file: Option<Box<DataFile>>,
+
+    /// The manifest-level sequence number of this data file entry.
+    #[serde(default)]
+    pub data_sequence_number: Option<i64>,
 }
 
 impl FileScanTask {
@@ -149,6 +160,13 @@ impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
             file_type: ctx.manifest_entry.content_type(),
             partition_spec_id: ctx.partition_spec_id,
             equality_ids: ctx.manifest_entry.data_file.equality_ids.clone(),
+            record_count: ctx.manifest_entry.record_count(),
+            file_format: ctx.manifest_entry.data_file.file_format(),
+            file_size_in_bytes: ctx.manifest_entry.data_file.file_size_in_bytes(),
+            sequence_number: ctx.manifest_entry.sequence_number(),
+            content_offset: ctx.manifest_entry.data_file.content_offset(),
+            content_size_in_bytes: ctx.manifest_entry.data_file.content_size_in_bytes(),
+            referenced_data_file: ctx.manifest_entry.data_file.referenced_data_file(),
         }
     }
 }
@@ -167,4 +185,47 @@ pub struct FileScanTaskDeleteFile {
 
     /// equality ids for equality deletes (null for anything other than equality-deletes)
     pub equality_ids: Option<Vec<i32>>,
+
+    /// Number of records in the delete file.
+    pub record_count: u64,
+
+    /// File format of the delete file.
+    pub file_format: DataFileFormat,
+
+    /// Size of the delete file in bytes.
+    pub file_size_in_bytes: u64,
+
+    /// Manifest-level sequence number of this delete file entry.
+    #[serde(default)]
+    pub sequence_number: Option<i64>,
+
+    /// Byte offset of the deletion-vector blob inside the Puffin file.
+    #[serde(default)]
+    pub content_offset: Option<i64>,
+
+    /// Byte length of the deletion-vector blob.
+    #[serde(default)]
+    pub content_size_in_bytes: Option<i64>,
+
+    /// Path of the data file this deletion vector applies to.
+    #[serde(default)]
+    pub referenced_data_file: Option<String>,
+}
+
+impl Default for FileScanTaskDeleteFile {
+    fn default() -> Self {
+        Self {
+            file_path: String::new(),
+            file_type: DataContentType::PositionDeletes,
+            partition_spec_id: 0,
+            equality_ids: None,
+            record_count: 0,
+            file_format: DataFileFormat::Parquet,
+            file_size_in_bytes: 0,
+            sequence_number: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            referenced_data_file: None,
+        }
+    }
 }

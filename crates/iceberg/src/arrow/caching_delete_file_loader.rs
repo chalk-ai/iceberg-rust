@@ -917,6 +917,7 @@ mod tests {
             file_type: DataContentType::PositionDeletes,
             partition_spec_id: 0,
             equality_ids: None,
+            ..Default::default()
         };
 
         let eq_del = FileScanTaskDeleteFile {
@@ -924,6 +925,7 @@ mod tests {
             file_type: DataContentType::EqualityDeletes,
             partition_spec_id: 0,
             equality_ids: Some(vec![2, 3]), // Only use field IDs that exist in both schemas
+            ..Default::default()
         };
 
         let file_scan_task = FileScanTask {
@@ -940,6 +942,8 @@ mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            data_file: None,
+            data_sequence_number: None,
         };
 
         // Load the deletes - should handle both types without error

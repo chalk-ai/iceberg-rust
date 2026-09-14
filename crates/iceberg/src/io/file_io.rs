@@ -124,6 +124,30 @@ impl FileIO {
         Ok(op.exists(relative_path).await?)
     }
 
+    /// List the immediate file children of a directory, returning their full URIs.
+    ///
+    /// # Arguments
+    ///
+    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
+    pub async fn list_directory(&self, path: impl AsRef<str>) -> Result<Vec<String>> {
+        let (op, relative_path) = self.inner.create_operator(&path)?;
+        let dir = if relative_path.ends_with('/') {
+            relative_path.to_string()
+        } else {
+            format!("{relative_path}/")
+        };
+        let scheme_prefix_len = path.as_ref().len() - relative_path.len();
+        let scheme_prefix = &path.as_ref()[..scheme_prefix_len];
+
+        Ok(op
+            .list(&dir)
+            .await?
+            .into_iter()
+            .filter(|entry| entry.metadata().is_file())
+            .map(|entry| format!("{scheme_prefix}{}", entry.path()))
+            .collect())
+    }
+
     /// Creates input file.
     ///
     /// # Arguments

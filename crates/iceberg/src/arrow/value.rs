@@ -24,7 +24,7 @@ use arrow_array::{
     Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow_buffer::NullBuffer;
-use arrow_schema::{DataType, FieldRef};
+use arrow_schema::{DataType, FieldRef, TimeUnit};
 use uuid::Uuid;
 
 use super::get_field_id_from_metadata;
@@ -785,6 +785,36 @@ pub(crate) fn create_primitive_array_repeated(
         (DataType::Date32, None) => {
             let vals: Vec<Option<i32>> = vec![None; num_rows];
             Arc::new(Date32Array::from(vals))
+        }
+        (DataType::Timestamp(TimeUnit::Microsecond, timezone), Some(PrimitiveLiteral::Long(value))) => {
+            let array = TimestampMicrosecondArray::from(vec![*value; num_rows]);
+            match timezone {
+                Some(timezone) => Arc::new(array.with_timezone(timezone.as_ref())),
+                None => Arc::new(array),
+            }
+        }
+        (DataType::Timestamp(TimeUnit::Microsecond, timezone), None) => {
+            let vals: Vec<Option<i64>> = vec![None; num_rows];
+            let array = TimestampMicrosecondArray::from(vals);
+            match timezone {
+                Some(timezone) => Arc::new(array.with_timezone(timezone.as_ref())),
+                None => Arc::new(array),
+            }
+        }
+        (DataType::Timestamp(TimeUnit::Nanosecond, timezone), Some(PrimitiveLiteral::Long(value))) => {
+            let array = TimestampNanosecondArray::from(vec![*value * 1_000; num_rows]);
+            match timezone {
+                Some(timezone) => Arc::new(array.with_timezone(timezone.as_ref())),
+                None => Arc::new(array),
+            }
+        }
+        (DataType::Timestamp(TimeUnit::Nanosecond, timezone), None) => {
+            let vals: Vec<Option<i64>> = vec![None; num_rows];
+            let array = TimestampNanosecondArray::from(vals);
+            match timezone {
+                Some(timezone) => Arc::new(array.with_timezone(timezone.as_ref())),
+                None => Arc::new(array),
+            }
         }
         (DataType::Int64, Some(PrimitiveLiteral::Long(value))) => {
             Arc::new(Int64Array::from(vec![*value; num_rows]))

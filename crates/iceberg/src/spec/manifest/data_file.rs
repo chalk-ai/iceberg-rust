@@ -286,6 +286,10 @@ impl DataFile {
     pub fn content_size_in_bytes(&self) -> Option<i64> {
         self.content_size_in_bytes
     }
+    /// Get the partition spec id associated with this data file.
+    pub fn partition_spec_id(&self) -> i32 {
+        self.partition_spec_id
+    }
 }
 
 /// Convert data files to avro bytes and write to writer.

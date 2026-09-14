@@ -26,6 +26,8 @@ use crate::writer::file_writer::location_generator::{FileNameGenerator, Location
 use crate::writer::file_writer::{FileWriter, FileWriterBuilder};
 use crate::{Error, ErrorKind, Result};
 
+const MAX_OUTPUT_FILE_PATH_ATTEMPTS: usize = 32;
+
 /// Builder for [`RollingFileWriter`].
 #[derive(Clone, Debug)]
 pub struct RollingFileWriterBuilder<
@@ -161,12 +163,28 @@ where
         self.current_written_size() > self.target_file_size
     }
 
-    fn new_output_file(&self, partition_key: &Option<PartitionKey>) -> Result<OutputFile> {
-        self.file_io
-            .new_output(self.location_generator.generate_location(
+    async fn new_output_file(
+        file_io: FileIO,
+        location_generator: L,
+        file_name_generator: F,
+        partition_key: Option<PartitionKey>,
+    ) -> Result<OutputFile> {
+        for _ in 0..MAX_OUTPUT_FILE_PATH_ATTEMPTS {
+            let location = location_generator.generate_location(
                 partition_key.as_ref(),
-                &self.file_name_generator.generate_file_name(),
-            ))
+                &file_name_generator.generate_file_name(),
+            );
+            if !file_io.exists(&location).await? {
+                return file_io.new_output(location);
+            }
+        }
+
+        Err(Error::new(
+            ErrorKind::Unexpected,
+            format!(
+                "Failed to allocate a unique output path after {MAX_OUTPUT_FILE_PATH_ATTEMPTS} attempts"
+            ),
+        ))
     }
 
     /// Writes a record batch to the current file, rolling over to a new file if necessary.
@@ -192,7 +210,15 @@ where
             // initialize inner writer
             self.inner = Some(
                 self.inner_builder
-                    .build(self.new_output_file(partition_key)?)
+                    .build(
+                        Self::new_output_file(
+                            self.file_io.clone(),
+                            self.location_generator.clone(),
+                            self.file_name_generator.clone(),
+                            partition_key.clone(),
+                        )
+                        .await?,
+                    )
                     .await?,
             );
         }
@@ -206,7 +232,15 @@ where
             // start a new writer
             self.inner = Some(
                 self.inner_builder
-                    .build(self.new_output_file(partition_key)?)
+                    .build(
+                        Self::new_output_file(
+                            self.file_io.clone(),
+                            self.location_generator.clone(),
+                            self.file_name_generator.clone(),
+                            partition_key.clone(),
+                        )
+                        .await?,
+                    )
                     .await?,
             );
         }
@@ -258,7 +292,7 @@ impl<B: FileWriterBuilder, L: LocationGenerator, F: FileNameGenerator> CurrentFi
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use arrow_array::{ArrayRef, Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
@@ -277,6 +311,29 @@ mod tests {
     };
     use crate::writer::tests::check_parquet_data_file;
     use crate::writer::{IcebergWriter, IcebergWriterBuilder, RecordBatch};
+
+    #[derive(Debug, Clone)]
+    struct StaticFileNameGenerator {
+        names: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl StaticFileNameGenerator {
+        fn new(names: Vec<String>) -> Self {
+            Self {
+                names: Arc::new(Mutex::new(names.into_iter().rev().collect())),
+            }
+        }
+    }
+
+    impl FileNameGenerator for StaticFileNameGenerator {
+        fn generate_file_name(&self) -> String {
+            self.names
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("test file name generator exhausted")
+        }
+    }
 
     fn make_test_schema() -> Result<Schema> {
         Schema::builder()
@@ -435,6 +492,52 @@ mod tests {
         assert_eq!(
             total_records, expected_rows as u64,
             "Expected {expected_rows} total records across all files"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rolling_writer_skips_existing_output_path() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen = StaticFileNameGenerator::new(vec![
+            "collision.parquet".to_string(),
+            "fresh.parquet".to_string(),
+        ]);
+        let schema = make_test_schema()?;
+        let parquet_writer_builder =
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), Arc::new(schema));
+
+        std::fs::write(temp_dir.path().join("collision.parquet"), b"occupied")?;
+
+        let rolling_writer_builder = RollingFileWriterBuilder::new(
+            parquet_writer_builder,
+            1024 * 1024,
+            file_io.clone(),
+            location_gen,
+            file_name_gen,
+        );
+        let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+        let mut writer = data_file_writer_builder.build(None).await?;
+
+        let batch = RecordBatch::try_new(Arc::new(make_test_arrow_schema()), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+        ])?;
+
+        writer.write(batch.clone()).await?;
+        let data_files = writer.close().await?;
+
+        assert_eq!(data_files.len(), 1);
+        assert!(data_files[0].file_path.ends_with("fresh.parquet"));
+        check_parquet_data_file(&file_io, &data_files[0], &batch).await;
+        assert_eq!(
+            std::fs::read(temp_dir.path().join("collision.parquet"))?,
+            b"occupied"
         );
 
         Ok(())

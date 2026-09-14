@@ -220,6 +220,11 @@ impl std::error::Error for Error {
 }
 
 impl Error {
+    /// Return contextual key-value pairs attached to this error.
+    pub fn context(&self) -> &[(&'static str, String)] {
+        &self.context
+    }
+
     /// Create a new Error with error kind and message.
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {

@@ -146,6 +146,8 @@ impl TableBuilder {
             identifier,
             readonly,
             object_cache,
+            retry_attempts: None,
+            retry_error_kinds: None,
         })
     }
 }
@@ -159,6 +161,10 @@ pub struct Table {
     identifier: TableIdent,
     readonly: bool,
     object_cache: Arc<ObjectCache>,
+    /// Number of retry attempts that occurred during the last commit operation.
+    pub(crate) retry_attempts: Option<usize>,
+    /// Error kinds encountered during retries.
+    pub(crate) retry_error_kinds: Option<String>,
 }
 
 impl Table {
@@ -172,6 +178,28 @@ impl Table {
     pub(crate) fn with_metadata_location(mut self, metadata_location: String) -> Self {
         self.metadata_location = Some(metadata_location);
         self
+    }
+
+    /// Sets the number of retry attempts and returns an updated instance.
+    pub(crate) fn with_retry_attempts(mut self, retry_attempts: usize) -> Self {
+        self.retry_attempts = Some(retry_attempts);
+        self
+    }
+
+    /// Returns the number of retry attempts from the last commit operation, if any.
+    pub fn retry_attempts(&self) -> Option<usize> {
+        self.retry_attempts
+    }
+
+    /// Sets the error kinds encountered during retries and returns an updated instance.
+    pub(crate) fn with_retry_error_kinds(mut self, error_kinds: String) -> Self {
+        self.retry_error_kinds = Some(error_kinds);
+        self
+    }
+
+    /// Returns the error kinds encountered during retries, if any.
+    pub fn retry_error_kinds(&self) -> Option<&str> {
+        self.retry_error_kinds.as_deref()
     }
 
     /// Returns a TableBuilder to build a table
