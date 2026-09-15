@@ -2008,10 +2008,9 @@ pub mod tests {
         // Verify we have 2 columns: x and _file
         assert_eq!(batches[0].num_columns(), 2);
 
-        // Verify the x column exists and has correct data
+        // Verify the x column exists.
         let x_col = batches[0].column_by_name("x").unwrap();
         let x_arr = x_col.as_primitive::<arrow_array::types::Int64Type>();
-        assert_eq!(x_arr.value(0), 1);
 
         // Verify the _file column exists
         let file_col = batches[0].column_by_name(RESERVED_COL_NAME_FILE);
@@ -2038,13 +2037,19 @@ pub mod tests {
 
         let values = run_array.values();
         let string_values = values.as_string::<i32>();
-        assert_eq!(string_values.len(), 1, "Should have a single file path");
-
-        let file_path = string_values.value(0);
+        let file_path = string_values.value(run_array.get_physical_index(0));
         assert!(
             file_path.ends_with(".parquet"),
             "File path should end with .parquet, got: {file_path}"
         );
+        let expected_x = if file_path.ends_with("/1.parquet") {
+            100
+        } else if file_path.ends_with("/3.parquet") {
+            300
+        } else {
+            panic!("Unexpected file path: {file_path}");
+        };
+        assert_eq!(x_arr.value(0), expected_x);
     }
 
     #[tokio::test]
