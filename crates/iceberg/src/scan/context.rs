@@ -28,8 +28,8 @@ use crate::scan::{
     PartitionFilterCache,
 };
 use crate::spec::{
-    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, SchemaRef, SnapshotRef,
-    TableMetadataRef,
+    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, NameMapping,
+    PartitionSpecRef, SchemaRef, SnapshotRef, TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -46,6 +46,8 @@ pub(crate) struct ManifestFileContext {
     snapshot_schema: SchemaRef,
     expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
     case_sensitive: bool,
+    name_mapping: Option<Arc<NameMapping>>,
+    partition_spec: Option<PartitionSpecRef>,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -59,6 +61,8 @@ pub(crate) struct ManifestEntryContext {
     pub partition_spec_id: i32,
     pub snapshot_schema: SchemaRef,
     pub case_sensitive: bool,
+    pub name_mapping: Option<Arc<NameMapping>>,
+    pub partition_spec: Option<PartitionSpecRef>,
 }
 
 type ManifestFileContextResults = (
@@ -78,6 +82,8 @@ impl ManifestFileContext {
             field_ids,
             mut sender,
             expression_evaluator_cache,
+            name_mapping,
+            partition_spec,
             ..
         } = self;
 
@@ -93,6 +99,8 @@ impl ManifestFileContext {
                 bound_predicates: bound_predicates.clone(),
                 snapshot_schema: snapshot_schema.clone(),
                 case_sensitive: self.case_sensitive,
+                name_mapping: name_mapping.clone(),
+                partition_spec: partition_spec.clone(),
             };
 
             sender
@@ -135,10 +143,8 @@ impl ManifestEntryContext {
 
             // Include partition data and spec from manifest entry
             partition: Some(self.manifest_entry.data_file.partition.clone()),
-            // TODO: Pass actual PartitionSpec through context chain for native flow
-            partition_spec: None,
-            // TODO: Extract name_mapping from table metadata property "schema.name-mapping.default"
-            name_mapping: None,
+            partition_spec: self.partition_spec.clone(),
+            name_mapping: self.name_mapping.clone(),
             case_sensitive: self.case_sensitive,
             data_file: Some(Box::new(self.manifest_entry.data_file().clone())),
             data_sequence_number: self.manifest_entry.sequence_number(),
@@ -157,6 +163,7 @@ pub(crate) struct PlanContext {
     pub case_sensitive: bool,
     pub predicate: Option<Arc<Predicate>>,
     pub snapshot_bound_predicate: Option<Arc<BoundPredicate>>,
+    pub name_mapping: Option<Arc<NameMapping>>,
     pub object_cache: Arc<ObjectCache>,
     pub field_ids: Arc<Vec<i32>>,
 
@@ -270,6 +277,10 @@ impl PlanContext {
             } else {
                 None
             };
+        let partition_spec = self
+            .table_metadata
+            .partition_spec_by_id(manifest_file.partition_spec_id)
+            .cloned();
 
         ManifestFileContext {
             manifest_file: manifest_file.clone(),
@@ -280,6 +291,8 @@ impl PlanContext {
             field_ids: self.field_ids.clone(),
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
             case_sensitive: self.case_sensitive,
+            name_mapping: self.name_mapping.clone(),
+            partition_spec,
         }
     }
 }
