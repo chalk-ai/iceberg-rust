@@ -122,10 +122,11 @@ impl SchemaVisitor for HiveSchemaBuilder {
             PrimitiveType::Date => "date".to_string(),
             PrimitiveType::Timestamp => "timestamp".to_string(),
             PrimitiveType::TimestampNs => "timestamp_ns".to_string(),
-            PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs => {
+            PrimitiveType::TimestamptzNs => "timestamptz_ns".to_string(),
+            PrimitiveType::Timestamptz => {
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
-                    format!("Conversion from {p:?} is not supported"),
+                    "Conversion from 'Timestamptz' is not supported",
                 ));
             }
             PrimitiveType::Time | PrimitiveType::String | PrimitiveType::Uuid => {
@@ -453,6 +454,57 @@ mod tests {
         ];
 
         assert_eq!(result, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_schema_with_timestamptz_fields() -> Result<()> {
+        let record = r#"{
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [
+                {
+                    "id": 1,
+                    "name": "updated_at",
+                    "required": true,
+                    "type": "timestamptz_ns"
+                }
+            ]
+        }"#;
+
+        let schema = serde_json::from_str::<Schema>(record)?;
+
+        let result = HiveSchemaBuilder::from_iceberg(&schema)?.build();
+
+        let expected = vec![FieldSchema {
+            name: Some("updated_at".into()),
+            r#type: Some("timestamptz_ns".into()),
+            comment: None,
+        }];
+
+        assert_eq!(result, expected);
+
+        let record = r#"{
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [
+                {
+                    "id": 1,
+                    "name": "created_at",
+                    "required": true,
+                    "type": "timestamptz"
+                }
+            ]
+        }"#;
+
+        let schema = serde_json::from_str::<Schema>(record)?;
+        let err = HiveSchemaBuilder::from_iceberg(&schema).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "FeatureUnsupported => Conversion from 'Timestamptz' is not supported"
+        );
 
         Ok(())
     }
