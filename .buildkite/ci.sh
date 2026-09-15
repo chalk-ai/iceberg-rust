@@ -16,6 +16,16 @@ ensure_cargo_bin() {
   fi
 }
 
+ensure_cargo_bin_version() {
+  local bin="$1"
+  local version="$2"
+  shift 2
+
+  if ! command -v "${bin}" >/dev/null 2>&1 || ! "${bin}" --version | grep -Fq "${version}"; then
+    retry_install --force "$@"
+  fi
+}
+
 case "${task}" in
   fmt)
     cargo fmt --all -- --check
@@ -52,7 +62,7 @@ case "${task}" in
     cargo machete
     ;;
   audit)
-    ensure_cargo_bin cargo-audit cargo-audit@0.21.2 --locked
+    ensure_cargo_bin_version cargo-audit 0.22.2 cargo-audit@0.22.2 --locked
     cargo audit
     ;;
   typos)

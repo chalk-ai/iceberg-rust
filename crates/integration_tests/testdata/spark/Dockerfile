@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM python:3.9-bullseye
+FROM python:3.9-bookworm
 
 RUN apt-get -qq update && \
-    apt-get -qq install -y --no-install-recommends sudo curl openjdk-11-jdk && \
+    apt-get -qq install -y --no-install-recommends sudo curl openjdk-17-jdk && \
     apt-get -qq clean && \
     rm -rf /var/lib/apt/lists/*
 
