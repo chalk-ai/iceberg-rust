@@ -54,7 +54,7 @@ services:
   mc:
     depends_on:
       - minio
-    image: minio/mc:RELEASE.2025-05-21T01-59-54Z
+    image: quay.io/minio/mc:RELEASE.2025-05-21T01-59-54Z
     environment:
       - AWS_ACCESS_KEY_ID=admin
       - AWS_SECRET_ACCESS_KEY=password

@@ -383,16 +383,7 @@ impl RecordBatchTransformer {
                             .get(field_id)
                             .ok_or(Error::new(ErrorKind::Unexpected, "field not found"))?
                             .0;
-                        let datum = constant_fields.get(field_id).ok_or(Error::new(
-                            ErrorKind::Unexpected,
-                            "constant field not found",
-                        ))?;
-                        let arrow_type = datum_to_arrow_type_with_ree(datum);
-                        // Use the type from constant_fields (REE for constants)
-                        let constant_field =
-                            Field::new(field.name(), arrow_type, field.is_nullable())
-                                .with_metadata(field.metadata().clone());
-                        Ok(Arc::new(constant_field))
+                        Ok(field.clone())
                     }
                 } else {
                     // Regular field - use schema as-is
@@ -486,10 +477,22 @@ impl RecordBatchTransformer {
                 // they exist in the Parquet file. This is per Iceberg spec rule #1: partition metadata
                 // is authoritative and should be preferred over file data.
                 if let Some(datum) = constant_fields.get(field_id) {
-                    let arrow_type = datum_to_arrow_type_with_ree(datum);
+                    let target_type = if get_metadata_field(*field_id).is_ok() {
+                        datum_to_arrow_type_with_ree(datum)
+                    } else {
+                        field_id_to_mapped_schema_map
+                            .get(field_id)
+                            .ok_or(Error::new(
+                                ErrorKind::Unexpected,
+                                "could not find field in schema",
+                            ))?
+                            .0
+                            .data_type()
+                            .clone()
+                    };
                     return Ok(ColumnSource::Add {
                         value: Some(datum.literal().clone()),
-                        target_type: arrow_type,
+                        target_type,
                     });
                 }
 
@@ -1361,7 +1364,8 @@ mod test {
         assert_eq!(get_int_value(result.column(0).as_ref(), 0), 100);
         assert_eq!(get_int_value(result.column(0).as_ref(), 1), 200);
 
-        // dept column comes from partition metadata (constant) - will be REE
+        // dept column comes from partition metadata and keeps the table column type.
+        assert!(result.column(1).as_any().is::<StringArray>());
         assert_eq!(
             get_string_value(result.column(1).as_ref(), 0),
             "engineering"
@@ -1577,7 +1581,8 @@ mod test {
         assert_eq!(get_int_value(result.column(0).as_ref(), 0), 100);
         assert_eq!(get_int_value(result.column(0).as_ref(), 1), 200);
 
-        // Rule #1: dept from partition metadata (identity transform) - will be REE
+        // Rule #1: dept from partition metadata (identity transform)
+        assert!(result.column(1).as_any().is::<StringArray>());
         assert_eq!(
             get_string_value(result.column(1).as_ref(), 0),
             "engineering"
@@ -1591,7 +1596,8 @@ mod test {
         assert_eq!(get_string_value(result.column(2).as_ref(), 0), "value1");
         assert_eq!(get_string_value(result.column(2).as_ref(), 1), "value2");
 
-        // Rule #3: category from initial_default - will be REE
+        // Rule #3: category from initial_default
+        assert!(result.column(3).as_any().is::<StringArray>());
         assert_eq!(
             get_string_value(result.column(3).as_ref(), 0),
             "default_category"
@@ -1601,8 +1607,8 @@ mod test {
             "default_category"
         );
 
-        // Rule #4: notes is null (no default, not in Parquet, not in partition) - will be REE with null
-        // For null REE arrays, we still use the helper which handles extraction
+        // Rule #4: notes is null (no default, not in Parquet, not in partition)
+        assert!(result.column(4).as_any().is::<StringArray>());
         assert_eq!(get_string_value(result.column(4).as_ref(), 0), "");
         assert_eq!(get_string_value(result.column(4).as_ref(), 1), "");
     }
