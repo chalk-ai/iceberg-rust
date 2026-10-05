@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Preserve Chalk's crate-native scan, equality-delete, transaction, summary, temporal and Glue retry regressions when replacing its vendored fork.
 - Require all 1,041 carried-forward native cases in the core/Glue/REST consumer CI lane and publish invocation evidence.
+- Materialize encoded partition constants at the DataFusion scan boundary to preserve its declared Arrow schema.
 
 ## [v0.8.0] - 2026-01-06
 

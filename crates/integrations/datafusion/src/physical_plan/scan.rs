@@ -20,8 +20,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::arrow::array::{RecordBatch, RecordBatchOptions};
+use datafusion::arrow::compute::cast;
+use datafusion::arrow::datatypes::{DataType, SchemaRef as ArrowSchemaRef};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -29,7 +30,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use datafusion::prelude::Expr;
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::table::Table;
 
@@ -144,7 +145,37 @@ impl ExecutionPlan for IcebergTableScan {
             self.projection.clone(),
             self.predicates.clone(),
         );
-        let stream = futures::stream::once(fut).try_flatten();
+        let schema = self.schema();
+        let stream = futures::stream::once(fut).try_flatten().map(move |result| {
+            let batch = result?;
+            if batch.schema() == schema {
+                return Ok(batch);
+            }
+
+            // Native scans encode partition constants as runs; DataFusion requires every
+            // batch to match its declared logical schema. Other type/count mismatches remain errors.
+            let columns = batch
+                .columns()
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, column)| match (column.data_type(), schema.fields().get(index)) {
+                        (DataType::RunEndEncoded(_, values), Some(field))
+                            if values.data_type() == field.data_type() =>
+                        {
+                            cast(column.as_ref(), field.data_type())
+                        }
+                        _ => Ok(column.clone()),
+                    },
+                )
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+            Ok(RecordBatch::try_new_with_options(
+                schema.clone(),
+                columns,
+                &options,
+            )?)
+        });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
