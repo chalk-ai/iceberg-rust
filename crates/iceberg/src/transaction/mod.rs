@@ -251,6 +251,7 @@ impl Transaction {
 
     fn build_backoff(props: TableProperties) -> Result<ExponentialBackoff> {
         Ok(ExponentialBuilder::new()
+            .with_jitter()
             .with_min_delay(Duration::from_millis(props.commit_min_retry_wait_ms))
             .with_max_delay(Duration::from_millis(props.commit_max_retry_wait_ms))
             .with_total_delay(Some(Duration::from_millis(
@@ -286,6 +287,21 @@ impl Transaction {
 
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
         let refreshed = catalog.load_table(self.table.identifier()).await?;
+
+        // Replaying actions against refreshed metadata is safe only for the same
+        // table identity; a reused catalog name must not inherit pending writes.
+        if refreshed.metadata().uuid() != self.table.metadata().uuid() {
+            return Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                format!(
+                    "Iceberg table UUID changed while committing {}",
+                    self.table.identifier()
+                ),
+            )
+            .with_retryable(false)
+            .with_context("expected_uuid", self.table.metadata().uuid().to_string())
+            .with_context("found_uuid", refreshed.metadata().uuid().to_string()));
+        }
 
         if self.table.metadata() != refreshed.metadata()
             || self.table.metadata_location() != refreshed.metadata_location()
@@ -512,6 +528,55 @@ mod tests {
             });
 
         mock_catalog
+    }
+
+    #[tokio::test]
+    async fn test_commit_rejects_table_replacement_before_and_after_conflict() {
+        for conflict_first in [false, true] {
+            let original = setup_test_table("3");
+            let replacement = original.clone().with_metadata(Arc::new(
+                original
+                    .metadata()
+                    .clone()
+                    .into_builder(None)
+                    .assign_uuid(uuid::Uuid::new_v4())
+                    .build()
+                    .unwrap()
+                    .metadata,
+            ));
+            let mut catalog = MockCatalog::new();
+            let loads = AtomicU32::new(0);
+            let original_copy = original.clone();
+            catalog
+                .expect_load_table()
+                .times(if conflict_first { 2 } else { 1 })
+                .returning_st(move |_| {
+                    let table = if conflict_first && loads.fetch_add(1, Ordering::SeqCst) == 0 {
+                        original_copy.clone()
+                    } else {
+                        replacement.clone()
+                    };
+                    Box::pin(async move { Ok(table) })
+                });
+            catalog
+                .expect_update_table()
+                .times(usize::from(conflict_first))
+                .returning_st(|_| {
+                    Box::pin(async {
+                        Err(
+                            Error::new(ErrorKind::CatalogCommitConflicts, "Commit conflict")
+                                .with_retryable(true),
+                        )
+                    })
+                });
+            let err = create_test_transaction(&original)
+                .commit(&catalog)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+            assert!(!err.retryable());
+            assert!(err.to_string().contains("UUID changed"));
+        }
     }
 
     #[tokio::test]

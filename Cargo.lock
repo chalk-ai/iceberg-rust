@@ -3422,8 +3422,10 @@ dependencies = [
  "ctor",
  "iceberg",
  "iceberg_test_utils",
+ "mockito",
  "port_scanner",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

@@ -21,6 +21,7 @@ use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
+use chrono::{NaiveDate, TimeDelta};
 use fnv::FnvHashSet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -143,10 +144,31 @@ impl Transform {
 
         if let Some(value) = value.as_primitive_literal() {
             let field_type = field_type.as_primitive_type().unwrap();
-            let datum = Datum::new(field_type.clone(), value);
+            let datum = Datum::new(field_type.clone(), value.clone());
 
-            match self {
-                Self::Void => "null".to_string(),
+            match (self, value) {
+                (Self::Void, _) => "null".to_string(),
+                (Self::Year, PrimitiveLiteral::Int(n)) => format!("{:04}", 1970 + i64::from(n)),
+                (Self::Month, PrimitiveLiteral::Int(n)) => {
+                    let year = 1970 + n.div_euclid(12);
+                    let month = n.rem_euclid(12) + 1;
+                    format!("{year:04}-{month:02}")
+                }
+                (Self::Day, PrimitiveLiteral::Int(n)) => {
+                    let date = (chrono::DateTime::UNIX_EPOCH
+                        + TimeDelta::try_days(i64::from(n)).unwrap())
+                    .naive_utc()
+                    .date();
+                    format!("{}", date.format("%Y-%m-%d"))
+                }
+                (Self::Hour, PrimitiveLiteral::Int(n)) => {
+                    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap();
+                    let dt = epoch + chrono::Duration::hours(i64::from(n));
+                    format!("{}", dt.format("%Y-%m-%d-%H"))
+                }
                 _ => datum.to_human_string(),
             }
         } else {
@@ -666,6 +688,15 @@ impl Transform {
                 (PrimitiveType::Timestamp, PrimitiveLiteral::Long(v)) => {
                     Some(Datum::timestamp_micros(v - 1))
                 }
+                (PrimitiveType::Timestamptz, PrimitiveLiteral::Long(v)) => {
+                    v.checked_sub(1).map(Datum::timestamptz_micros)
+                }
+                (PrimitiveType::TimestampNs, PrimitiveLiteral::Long(v)) => {
+                    v.checked_sub(1).map(Datum::timestamp_nanos)
+                }
+                (PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(v)) => {
+                    v.checked_sub(1).map(Datum::timestamptz_nanos)
+                }
                 _ => Some(datum.to_owned()),
             },
             PredicateOperator::GreaterThan => match (datum.data_type(), datum.literal()) {
@@ -677,6 +708,15 @@ impl Transform {
                 (PrimitiveType::Date, PrimitiveLiteral::Int(v)) => Some(Datum::date(v + 1)),
                 (PrimitiveType::Timestamp, PrimitiveLiteral::Long(v)) => {
                     Some(Datum::timestamp_micros(v + 1))
+                }
+                (PrimitiveType::Timestamptz, PrimitiveLiteral::Long(v)) => {
+                    v.checked_add(1).map(Datum::timestamptz_micros)
+                }
+                (PrimitiveType::TimestampNs, PrimitiveLiteral::Long(v)) => {
+                    v.checked_add(1).map(Datum::timestamp_nanos)
+                }
+                (PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(v)) => {
+                    v.checked_add(1).map(Datum::timestamptz_nanos)
                 }
                 _ => Some(datum.to_owned()),
             },
@@ -1056,4 +1096,101 @@ impl<'de> Deserialize<'de> for Transform {
 enum AdjustedProjection {
     Single(Datum),
     Set(FnvHashSet<Datum>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::datatypes::{PrimitiveType, Type};
+
+    fn check_boundary(op: PredicateOperator, input: Datum, expected: Datum) {
+        let result = Transform::adjust_boundary(&op, &input).unwrap().unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_adjust_boundary_timestamp_types() {
+        for (datum, dec, inc) in [
+            (
+                Datum::timestamptz_micros(1000),
+                Datum::timestamptz_micros(999),
+                Datum::timestamptz_micros(1001),
+            ),
+            (
+                Datum::timestamp_nanos(5000),
+                Datum::timestamp_nanos(4999),
+                Datum::timestamp_nanos(5001),
+            ),
+            (
+                Datum::timestamptz_nanos(5000),
+                Datum::timestamptz_nanos(4999),
+                Datum::timestamptz_nanos(5001),
+            ),
+        ] {
+            check_boundary(PredicateOperator::LessThan, datum.clone(), dec);
+            check_boundary(PredicateOperator::GreaterThan, datum.clone(), inc);
+            check_boundary(
+                PredicateOperator::LessThanOrEq,
+                datum.clone(),
+                datum.clone(),
+            );
+            check_boundary(PredicateOperator::GreaterThanOrEq, datum.clone(), datum);
+        }
+        for make_datum in [
+            Datum::timestamptz_micros,
+            Datum::timestamp_nanos,
+            Datum::timestamptz_nanos,
+        ] {
+            assert!(
+                Transform::adjust_boundary(&PredicateOperator::LessThan, &make_datum(i64::MIN))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                Transform::adjust_boundary(&PredicateOperator::GreaterThan, &make_datum(i64::MAX))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn test_month_to_human_string_formats_pre_epoch_values() {
+        let value = Literal::Primitive(PrimitiveLiteral::Int(-1));
+
+        assert_eq!(
+            Transform::Month.to_human_string(&Type::Primitive(PrimitiveType::Date), Some(&value)),
+            "1969-12"
+        );
+    }
+
+    #[test]
+    fn test_month_to_human_string_formats_epoch_values() {
+        let value = Literal::Primitive(PrimitiveLiteral::Int(0));
+
+        assert_eq!(
+            Transform::Month.to_human_string(&Type::Primitive(PrimitiveType::Date), Some(&value)),
+            "1970-01"
+        );
+    }
+
+    #[test]
+    fn test_day_to_human_string_formats_pre_epoch_values() {
+        let value = Literal::Primitive(PrimitiveLiteral::Int(-1));
+
+        assert_eq!(
+            Transform::Day.to_human_string(&Type::Primitive(PrimitiveType::Date), Some(&value)),
+            "1969-12-31"
+        );
+    }
+
+    #[test]
+    fn test_day_to_human_string_formats_epoch_values() {
+        let value = Literal::Primitive(PrimitiveLiteral::Int(0));
+
+        assert_eq!(
+            Transform::Day.to_human_string(&Type::Primitive(PrimitiveType::Date), Some(&value)),
+            "1970-01-01"
+        );
+    }
 }

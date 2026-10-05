@@ -15,17 +15,126 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize, Serializer};
 
-use crate::Result;
 use crate::expr::BoundPredicate;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec,
-    Schema, SchemaRef, Struct,
+    PrimitiveType, Schema, SchemaRef, Struct, TableMetadata, Type,
 };
+use crate::{Error, ErrorKind, Result};
+
+/// Extend a scan schema with dropped top-level fields needed by applicable equality deletes.
+///
+/// Field IDs, not names, identify delete keys. Recovered fields receive private names so a
+/// reused user column name cannot bind a delete to the replacement column. Callers must keep
+/// their visible schema and output projection unchanged; this schema is only for reading.
+pub fn schema_with_equality_delete_fields(
+    schema: SchemaRef,
+    metadata: &TableMetadata,
+    equality_ids: impl IntoIterator<Item = i32>,
+) -> Result<SchemaRef> {
+    let missing_ids = equality_ids
+        .into_iter()
+        .filter(|id| schema.field_by_id(*id).is_none())
+        .collect::<BTreeSet<_>>();
+    if missing_ids.is_empty() {
+        return Ok(schema);
+    }
+
+    let mut history = metadata.schemas_iter().collect::<Vec<_>>();
+    history.sort_by_key(|schema| schema.schema_id());
+    let mut recovered = Vec::with_capacity(missing_ids.len());
+    let mut names = schema
+        .field_id_to_name_map()
+        .values()
+        .map(|name| name.to_lowercase())
+        .collect::<BTreeSet<_>>();
+    for id in missing_ids {
+        let mut definitions = history.iter().filter_map(|schema| schema.field_by_id(id));
+        let mut field = definitions
+            .next()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Equality delete field {id} is absent from retained table schemas"),
+                )
+            })?
+            .as_ref()
+            .clone();
+        if history.iter().any(|schema| {
+            schema.field_by_id(id).is_some() && schema.as_struct().field_by_id(id).is_none()
+        }) || !matches!(field.field_type.as_ref(), Type::Primitive(_))
+        {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!("Recovering nested equality delete field {id} is not supported"),
+            ));
+        }
+        // Schema IDs need not encode chronology. Reconcile legal widening promotions instead
+        // of choosing whichever retained schema happens to be visited first.
+        for definition in definitions {
+            field.field_type = Box::new(equality_delete_field_type(
+                id,
+                &field.field_type,
+                &definition.field_type,
+            )?);
+        }
+        field.name = format!("__iceberg_equality_delete_{id}");
+        while !names.insert(field.name.to_lowercase()) {
+            field.name.push('_');
+        }
+        // Files written before the key was added represent its missing value as null.
+        field.required = false;
+        recovered.push(Arc::new(field));
+    }
+
+    Ok(Arc::new(
+        schema
+            .as_ref()
+            .clone()
+            .into_builder()
+            .with_fields(recovered)
+            .build()?,
+    ))
+}
+
+fn equality_delete_field_type(id: i32, left: &Type, right: &Type) -> Result<Type> {
+    use PrimitiveType::{Decimal, Double, Float, Int, Long};
+    use Type::Primitive;
+
+    let primitive = match (left, right) {
+        _ if left == right => return Ok(left.clone()),
+        (Primitive(Int), Primitive(Long)) | (Primitive(Long), Primitive(Int)) => Long,
+        (Primitive(Float), Primitive(Double)) | (Primitive(Double), Primitive(Float)) => Double,
+        (
+            Primitive(Decimal {
+                precision: left_precision,
+                scale: left_scale,
+            }),
+            Primitive(Decimal {
+                precision: right_precision,
+                scale: right_scale,
+            }),
+        ) if left_scale == right_scale => Decimal {
+            precision: (*left_precision).max(*right_precision),
+            scale: *left_scale,
+        },
+        _ => {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Incompatible retained types for equality delete field {id}: {left} and {right}"
+                ),
+            ));
+        }
+    };
+    Ok(Primitive(primitive))
+}
 
 /// A stream of [`FileScanTask`].
 pub type FileScanTaskStream = BoxStream<'static, Result<FileScanTask>>;
@@ -67,7 +176,8 @@ pub struct FileScanTask {
     /// The format of the file to scan.
     pub data_file_format: DataFileFormat,
 
-    /// The schema of the file to scan.
+    /// The read schema, including any dropped fields required by equality deletes.
+    /// `project_field_ids` controls the output independently of these internal fields.
     pub schema: SchemaRef,
     /// The field ids to project.
     pub project_field_ids: Vec<i32>,
@@ -227,5 +337,134 @@ impl Default for FileScanTaskDeleteFile {
             content_size_in_bytes: None,
             referenced_data_file: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::spec::{FormatVersion, NestedField, PartitionSpec, SortOrder, TableMetadataBuilder};
+
+    fn metadata_with_history(types: &[PrimitiveType]) -> TableMetadata {
+        let schema = |field_type: &PrimitiveType| {
+            Schema::builder()
+                .with_fields([Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(field_type.clone()),
+                ))])
+                .build()
+                .unwrap()
+        };
+        let mut builder = TableMetadataBuilder::new(
+            schema(&types[0]),
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory://table".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap();
+        for field_type in &types[1..] {
+            builder = builder.add_schema(schema(field_type)).unwrap();
+        }
+        builder.build().unwrap().metadata
+    }
+
+    #[test]
+    fn equality_delete_fields_preserve_visible_names_and_identity() {
+        let metadata = metadata_with_history(&[PrimitiveType::Long]);
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields([
+                    Arc::new(NestedField::optional(
+                        2,
+                        "id",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::optional(
+                        3,
+                        "__ICEBERG_EQUALITY_DELETE_1",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let result = schema_with_equality_delete_fields(schema.clone(), &metadata, [1, 1]).unwrap();
+        assert_eq!(result.as_struct().fields().len(), 3);
+        assert_eq!(result.field_by_name("id").unwrap().id, 2);
+        assert_eq!(
+            result.field_by_id(1).unwrap().name,
+            "__iceberg_equality_delete_1_"
+        );
+        assert_eq!(
+            result.field_by_id(1).unwrap().field_type.as_ref(),
+            &Type::Primitive(PrimitiveType::Long)
+        );
+        assert!(schema.field_by_id(1).is_none());
+        assert!(Arc::ptr_eq(
+            &schema,
+            &schema_with_equality_delete_fields(schema.clone(), &metadata, [2]).unwrap()
+        ));
+    }
+
+    #[test]
+    fn equality_delete_fields_reconcile_promotions_independently_of_history_order() {
+        for types in [vec![PrimitiveType::Int, PrimitiveType::Long], vec![
+            PrimitiveType::Long,
+            PrimitiveType::Int,
+        ]] {
+            let metadata = metadata_with_history(&types);
+            let result = schema_with_equality_delete_fields(
+                Arc::new(Schema::builder().build().unwrap()),
+                &metadata,
+                [1],
+            )
+            .unwrap();
+            assert_eq!(
+                result.field_by_id(1).unwrap().field_type.as_ref(),
+                &Type::Primitive(PrimitiveType::Long)
+            );
+        }
+        let metadata = metadata_with_history(&[
+            PrimitiveType::Decimal {
+                precision: 20,
+                scale: 2,
+            },
+            PrimitiveType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        ]);
+        let result = schema_with_equality_delete_fields(
+            Arc::new(Schema::builder().build().unwrap()),
+            &metadata,
+            [1],
+        )
+        .unwrap();
+        assert_eq!(
+            result.field_by_id(1).unwrap().field_type.as_ref(),
+            &Type::Primitive(PrimitiveType::Decimal {
+                precision: 20,
+                scale: 2
+            })
+        );
+    }
+
+    #[test]
+    fn equality_delete_fields_reject_missing_or_incompatible_definitions() {
+        let metadata = metadata_with_history(&[PrimitiveType::Long, PrimitiveType::String]);
+        let schema = Arc::new(Schema::builder().build().unwrap());
+        let error = schema_with_equality_delete_fields(schema.clone(), &metadata, [1]).unwrap_err();
+        assert!(error.to_string().contains("Incompatible retained types"));
+        let error = schema_with_equality_delete_fields(schema, &metadata, [999]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("absent from retained table schemas")
+        );
     }
 }

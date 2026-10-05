@@ -24,6 +24,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased — Chalk compatibility
+
+- Preserve Chalk's crate-native scan, equality-delete, transaction, summary, temporal and Glue retry regressions when replacing its vendored fork.
+- Preserve recursive Parquet name mapping, Glue/REST error classification, duration schema conversion, fixed-width UUID manifest writes, retry jitter and deletion-only manifests across the fork upgrade.
+- Require the carried-forward and compatibility regressions in the core/Glue/REST consumer CI lane and publish invocation evidence.
+
 ## [v0.8.0] - 2026-01-06
 
 ### Breaking Changes

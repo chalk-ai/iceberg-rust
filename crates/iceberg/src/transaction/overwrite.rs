@@ -227,12 +227,14 @@ impl OverwriteOperation {
             Uuid::now_v7(),
         );
         let output_file = table.file_io().new_output(&new_manifest_path)?;
+        // These entries retain their original partition tuples and field IDs.
+        // Only their status changes; the manifest's schema and spec must not.
         let builder = ManifestWriterBuilder::new(
             output_file,
             Some(self.snapshot_id),
             manifest_file.key_metadata.clone(),
-            table.metadata().current_schema().clone(),
-            table.metadata().default_partition_spec().as_ref().clone(),
+            manifest.metadata().schema().clone(),
+            manifest.metadata().partition_spec().clone(),
         );
 
         let mut writer = match table.metadata().format_version() {
@@ -247,8 +249,9 @@ impl OverwriteOperation {
             },
         };
 
-        for entry in manifest.entries() {
-            if entry.is_alive() && self.deleted_file_paths.contains(entry.file_path()) {
+        // Deleted entries belong to prior snapshots and must not become Existing.
+        for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+            if self.deleted_file_paths.contains(entry.file_path()) {
                 let mut deleted: ManifestEntry = (**entry).clone();
                 deleted.snapshot_id = Some(self.snapshot_id);
                 writer.add_delete_entry(deleted)?;
@@ -415,6 +418,412 @@ mod tests {
             manifest.entries()[0].snapshot_id().unwrap()
         );
         assert_eq!(data_file, *manifest.entries()[0].data_file());
+    }
+
+    async fn live_snapshot_files(
+        table: &crate::table::Table,
+        snapshot_id: i64,
+    ) -> crate::Result<Vec<crate::spec::DataFile>> {
+        let snapshot = table.metadata().snapshot_by_id(snapshot_id).unwrap();
+        let manifests = snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await?;
+        let mut files = Vec::new();
+        for manifest_file in manifests.entries() {
+            let manifest = manifest_file.load_manifest(table.file_io()).await?;
+            assert_eq!(
+                manifest.metadata().partition_spec().spec_id(),
+                manifest_file.partition_spec_id
+            );
+            for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                assert_eq!(
+                    entry.data_file().partition_spec_id(),
+                    manifest_file.partition_spec_id
+                );
+                files.push(entry.data_file().clone());
+            }
+        }
+        files.sort_by(|left, right| left.file_path().cmp(right.file_path()));
+        Ok(files)
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_rejects_invalid_removed_partition() {
+        let table = make_v2_minimal_table();
+        for unknown_spec in [false, true] {
+            let file = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path("test/removed.parquet".to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(1)
+                .partition_spec_id(
+                    table.metadata().default_partition_spec_id() + i32::from(unknown_spec),
+                )
+                .partition(Struct::from_iter([Some(Literal::string("invalid"))]))
+                .build()
+                .unwrap();
+            let tx = Transaction::new(&table);
+            let result = Arc::new(tx.overwrite().delete_data_files(vec![file]))
+                .commit(&table)
+                .await;
+            let error = result.err().unwrap();
+            let source = std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<crate::Error>()
+                .unwrap();
+            assert_eq!(source.kind(), crate::ErrorKind::DataInvalid);
+            assert!(source.message().contains(if unknown_spec {
+                "unknown partition spec"
+            } else {
+                "incompatible with retained table schemas"
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_does_not_restore_previously_deleted_files()
+    -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use crate::spec::{NestedField, PrimitiveType, Schema, Type};
+        use crate::transaction::ApplyTransactionAction;
+        use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
+
+        let directory = tempfile::tempdir()?;
+        let warehouse = format!("file://{}", directory.path().display());
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "test",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+            )
+            .await?;
+        let namespace = NamespaceIdent::new("test".to_string());
+        catalog.create_namespace(&namespace, HashMap::new()).await?;
+        let schema = Schema::builder()
+            .with_fields([
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()?;
+        let mut table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("rows".to_string())
+                    .schema(schema)
+                    .build(),
+            )
+            .await?;
+        let make_file = |name: &str| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(format!("{warehouse}/{name}.parquet"))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(3_000_000_000)
+                .record_count(1)
+                .partition_spec_id(0)
+                .partition(Struct::from_iter([]))
+                .build()
+        };
+        let first = make_file("a")?;
+        let second = make_file("b")?;
+        let third = make_file("c")?;
+        let original_files = vec![first.clone(), second.clone()];
+        // Both files share a manifest so deleting one leaves a mixed-status manifest.
+        let tx = Transaction::new(&table);
+        table = tx
+            .fast_append()
+            .add_data_files(original_files.clone())
+            .apply(tx)?
+            .commit(&catalog)
+            .await?;
+        let original_snapshot = table.metadata().current_snapshot_id().unwrap();
+        let assert_totals = |table: &crate::table::Table, expected_files: u64| {
+            let properties = &table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .additional_properties;
+            assert_eq!(properties["total-data-files"], expected_files.to_string());
+            assert_eq!(properties["total-records"], expected_files.to_string());
+            assert_eq!(
+                properties["total-files-size"],
+                (expected_files * 3_000_000_000).to_string()
+            );
+        };
+        assert_totals(&table, 2);
+
+        let tx = Transaction::new(&table);
+        table = tx
+            .overwrite()
+            .delete_data_files([first])
+            .add_data_files([third.clone()])
+            .apply(tx)?
+            .commit(&catalog)
+            .await?;
+        let partial_snapshot = table.metadata().current_snapshot_id().unwrap();
+        assert_totals(&table, 2);
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .additional_properties["deleted-data-files"],
+            "1"
+        );
+        let partial_files = vec![second, third];
+        assert_eq!(
+            live_snapshot_files(&table, partial_snapshot).await?,
+            partial_files
+        );
+
+        let tx = Transaction::new(&table);
+        table = tx
+            .overwrite()
+            .delete_data_files(partial_files.clone())
+            .apply(tx)?
+            .commit(&catalog)
+            .await?;
+        let overwrite_snapshot = table.metadata().current_snapshot_id().unwrap();
+        assert_totals(&table, 0);
+        assert!(
+            live_snapshot_files(&table, overwrite_snapshot)
+                .await?
+                .is_empty()
+        );
+        assert_eq!(
+            live_snapshot_files(&table, partial_snapshot).await?,
+            partial_files
+        );
+        assert_eq!(
+            live_snapshot_files(&table, original_snapshot).await?,
+            original_files
+        );
+        let replacement = make_file("d")?;
+        let tx = Transaction::new(&table);
+        table = tx
+            .overwrite()
+            .add_data_files([replacement.clone()])
+            .apply(tx)?
+            .commit(&catalog)
+            .await?;
+        assert_totals(&table, 1);
+        assert_eq!(
+            live_snapshot_files(&table, table.metadata().current_snapshot_id().unwrap()).await?,
+            vec![replacement]
+        );
+        assert!(
+            live_snapshot_files(&table, overwrite_snapshot)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_preserves_mixed_partition_layouts()
+    -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use crate::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, Transform, Type};
+        use crate::transaction::ApplyTransactionAction;
+        use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCommit, TableCreation};
+
+        for extra_partition_field in [false, true] {
+            for empty in [false, true] {
+                let directory = tempfile::tempdir()?;
+                let warehouse = format!("file://{}", directory.path().display());
+                let catalog = MemoryCatalogBuilder::default()
+                    .load(
+                        "test",
+                        HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+                    )
+                    .await?;
+                let namespace = NamespaceIdent::new("test".to_string());
+                catalog.create_namespace(&namespace, HashMap::new()).await?;
+                let schema = Schema::builder()
+                    .with_fields([
+                        NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                        NestedField::optional(2, "region", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                    ])
+                    .build()?;
+                let old_spec = PartitionSpec::builder(schema.clone())
+                    .add_partition_field("id", "id", Transform::Identity)?
+                    .build()?;
+                let mut table = catalog
+                    .create_table(
+                        &namespace,
+                        TableCreation::builder()
+                            .name("rows".to_string())
+                            .schema(schema)
+                            .partition_spec(old_spec.into_unbound())
+                            .build(),
+                    )
+                    .await?;
+                let uuid = table.metadata().uuid();
+                let make_file = |name: &str, spec_id, partition| {
+                    DataFileBuilder::default()
+                        .content(DataContentType::Data)
+                        .file_path(format!("{warehouse}/{name}.parquet"))
+                        .file_format(DataFileFormat::Parquet)
+                        .file_size_in_bytes(100)
+                        .record_count(1)
+                        .partition_spec_id(spec_id)
+                        .partition(partition)
+                        .build()
+                };
+                let old_files = vec![
+                    make_file("old-a", 0, Struct::from_iter([Some(Literal::int(10))]))?,
+                    make_file("old-b", 0, Struct::from_iter([Some(Literal::int(11))]))?,
+                ];
+                let tx = Transaction::new(&table);
+                table = tx
+                    .fast_append()
+                    .add_data_files(old_files.clone())
+                    .apply(tx)?
+                    .commit(&catalog)
+                    .await?;
+                let old_snapshot = table.metadata().current_snapshot_id().unwrap();
+
+                // The old identity tuple remains int even after promoting its source
+                // column; the new spec starts with a string and can also be wider.
+                let schema = Schema::builder()
+                    .with_schema_id(1)
+                    .with_fields([
+                        NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                        NestedField::optional(2, "region", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                    ])
+                    .build()?;
+                let mut spec = PartitionSpec::builder(schema.clone())
+                    .with_spec_id(1)
+                    .with_last_assigned_field_id(table.metadata().last_partition_id())
+                    .add_partition_field("region", "region", Transform::Identity)?;
+                let mut partition = vec![Some(Literal::string("east"))];
+                if extra_partition_field {
+                    spec = spec.add_partition_field("id", "id", Transform::Identity)?;
+                    partition.push(Some(Literal::long(20)));
+                }
+                table = catalog
+                    .update_table(
+                        TableCommit::builder()
+                            .ident(table.identifier().clone())
+                            .requirements(vec![TableRequirement::UuidMatch { uuid }])
+                            .updates(vec![
+                                TableUpdate::AddSchema { schema },
+                                TableUpdate::SetCurrentSchema { schema_id: -1 },
+                                TableUpdate::AddSpec {
+                                    spec: spec.build()?.into_unbound(),
+                                },
+                                TableUpdate::SetDefaultSpec { spec_id: -1 },
+                            ])
+                            .build(),
+                    )
+                    .await?;
+                let partition = Struct::from_iter(partition);
+                let new_file = make_file(
+                    "new",
+                    table.metadata().default_partition_spec_id(),
+                    partition.clone(),
+                )?;
+                let tx = Transaction::new(&table);
+                table = tx
+                    .fast_append()
+                    .add_data_files(vec![new_file.clone()])
+                    .apply(tx)?
+                    .commit(&catalog)
+                    .await?;
+                let mixed_snapshot = table.metadata().current_snapshot_id().unwrap();
+                let mixed_files = live_snapshot_files(&table, mixed_snapshot).await?;
+                assert_eq!(mixed_files.len(), 3);
+                assert_eq!(live_snapshot_files(&table, old_snapshot).await?, old_files);
+                let specs: HashMap<_, _> = table
+                    .metadata()
+                    .partition_specs_iter()
+                    .map(|spec| (spec.spec_id(), spec.clone()))
+                    .collect();
+
+                let replacement = make_file(
+                    "replacement",
+                    table.metadata().default_partition_spec_id(),
+                    partition.clone(),
+                )?;
+                let added_files = if empty {
+                    vec![]
+                } else {
+                    vec![replacement.clone()]
+                };
+                let tx = Transaction::new(&table);
+                table = tx
+                    .overwrite()
+                    .delete_data_files(mixed_files.clone())
+                    .add_data_files(added_files)
+                    .apply(tx)?
+                    .commit(&catalog)
+                    .await?;
+                let overwrite_snapshot = table.metadata().current_snapshot_id().unwrap();
+                let expected_files = if empty {
+                    vec![]
+                } else {
+                    vec![replacement.clone()]
+                };
+                assert_eq!(
+                    live_snapshot_files(&table, overwrite_snapshot).await?,
+                    expected_files
+                );
+                assert_eq!(live_snapshot_files(&table, old_snapshot).await?, old_files);
+                assert_eq!(
+                    live_snapshot_files(&table, mixed_snapshot).await?,
+                    mixed_files
+                );
+                assert_eq!(table.metadata().uuid(), uuid);
+                assert_eq!(
+                    table
+                        .metadata()
+                        .partition_specs_iter()
+                        .map(|spec| (spec.spec_id(), spec.clone()))
+                        .collect::<HashMap<_, _>>(),
+                    specs
+                );
+                assert_eq!(table.metadata().current_schema_id(), 1);
+                assert_eq!(table.metadata().default_partition_spec_id(), 1);
+                let summary = &table
+                    .metadata()
+                    .current_snapshot()
+                    .unwrap()
+                    .summary()
+                    .additional_properties;
+                assert_eq!(summary["deleted-records"], mixed_files.len().to_string());
+                assert_eq!(summary["total-records"], expected_files.len().to_string());
+
+                let appended = make_file("appended", 1, partition)?;
+                let tx = Transaction::new(&table);
+                table = tx
+                    .fast_append()
+                    .add_data_files(vec![appended.clone()])
+                    .apply(tx)?
+                    .commit(&catalog)
+                    .await?;
+                let mut expected_appended = expected_files.clone();
+                expected_appended.push(appended);
+                expected_appended.sort_by(|left, right| left.file_path().cmp(right.file_path()));
+                assert_eq!(
+                    live_snapshot_files(&table, table.metadata().current_snapshot_id().unwrap())
+                        .await?,
+                    expected_appended
+                );
+                assert_eq!(
+                    live_snapshot_files(&table, overwrite_snapshot).await?,
+                    expected_files
+                );
+                assert_eq!(
+                    live_snapshot_files(&table, mixed_snapshot).await?,
+                    mixed_files
+                );
+            }
+        }
+        Ok(())
     }
 
     // This upstream test depends on `crate::memory::tests::new_memory_catalog` and

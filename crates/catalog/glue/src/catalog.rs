@@ -21,6 +21,8 @@ use std::fmt::Debug;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use aws_sdk_glue::operation::create_table::CreateTableError;
+use aws_sdk_glue::operation::delete_table::DeleteTableError;
+use aws_sdk_glue::operation::get_table::GetTableError;
 use aws_sdk_glue::operation::update_table::UpdateTableError;
 use aws_sdk_glue::types::TableInput;
 use iceberg::io::{
@@ -35,8 +37,9 @@ use iceberg::{
 
 use crate::error::{from_aws_build_error, from_aws_sdk_error};
 use crate::utils::{
-    convert_to_database, convert_to_glue_table, convert_to_namespace, create_sdk_config,
-    get_default_table_location, get_metadata_location, validate_namespace,
+    AWS_GLUE_SDK_RETRY_MAX_ATTEMPTS, convert_to_database, convert_to_glue_table,
+    convert_to_namespace, create_sdk_config, get_default_table_location, get_metadata_location,
+    validate_namespace,
 };
 use crate::{
     AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, with_catalog_id,
@@ -206,7 +209,7 @@ impl GlueCatalog {
     /// # Errors
     /// This function may return an error in several scenarios, including:
     /// - Failure to validate the namespace.
-    /// - Failure to retrieve the table from the Glue Catalog.
+    /// - A missing table or database, surfaced as [`ErrorKind::TableNotFound`].
     /// - Absence of metadata location information in the table's properties.
     /// - Issues reading or deserializing the table's metadata file.
     pub async fn load_table_with_version_id(
@@ -224,7 +227,21 @@ impl GlueCatalog {
             .name(table_name);
         let builder = with_catalog_id!(builder, self.config);
 
-        let glue_table_output = builder.send().await.map_err(from_aws_sdk_error)?;
+        let glue_table_output = builder.send().await.map_err(|e| {
+            let error = e.into_service_error();
+            match error {
+                // Glue uses the same error for a missing table and a missing database.
+                GetTableError::EntityNotFoundException(_) => Error::new(
+                    ErrorKind::TableNotFound,
+                    format!("Table {db_name}.{table_name} not found"),
+                ),
+                _ => Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to load table {db_name}.{table_name}"),
+                ),
+            }
+            .with_source(anyhow!("aws sdk error: {error:?}"))
+        })?;
 
         let glue_table = glue_table_output.table().ok_or_else(|| {
             Error::new(
@@ -238,7 +255,24 @@ impl GlueCatalog {
         let version_id = glue_table.version_id.clone();
         let metadata_location = get_metadata_location(&glue_table.parameters)?;
 
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
+        let metadata = match TableMetadata::read_from(&self.file_io, &metadata_location).await {
+            Ok(metadata) => metadata,
+            // Only a confirmed missing object makes the catalog pointer defunct;
+            // a transient read or existence-check failure must keep its original error.
+            Err(error) => match self.file_io.exists(&metadata_location).await {
+                Ok(false) => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "metadata file {metadata_location} of table \
+                             {db_name}.{table_name} does not exist"
+                        ),
+                    )
+                    .with_source(error));
+                }
+                _ => return Err(error),
+            },
+        };
 
         let table = Table::builder()
             .file_io(self.file_io())
@@ -283,7 +317,7 @@ impl GlueCatalog {
                 staged_metadata_location.to_string(),
                 staged_table.metadata(),
                 staged_table.metadata().properties(),
-                Some(current_metadata_location),
+                Some(current_metadata_location.clone()),
             )?);
 
         if let Some(version_id) = current_version_id {
@@ -303,10 +337,35 @@ impl GlueCatalog {
                     format!("Commit failed for table: {table_ident}"),
                 )
                 .with_retryable(true),
-                _ => Error::new(
+                UpdateTableError::InternalServiceException(ref e) => Error::new(
                     ErrorKind::Unexpected,
-                    format!("Operation failed for table: {table_ident} for hitting aws sdk error"),
-                ),
+                    format!("Transient Glue error for table {table_ident}: {e}"),
+                )
+                .with_retryable(true),
+                UpdateTableError::OperationTimeoutException(ref e) => Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Transient Glue error for table {table_ident}: {e}"),
+                )
+                .with_retryable(true),
+                UpdateTableError::ResourceNumberLimitExceededException(ref e) => Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Transient Glue error for table {table_ident}: {e}"),
+                )
+                .with_retryable(true),
+                _ => {
+                    tracing::error!(
+                        "Unexpected error from Glue UpdateTable for table {table_ident}: {error:?}. \
+                         current_metadata_location={current_metadata_location}, \
+                         staged_metadata_location={staged_metadata_location}"
+                    );
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!(
+                            "Operation failed for table {table_ident} after applying AWS Glue SDK retry policy \
+                             (max_attempts={AWS_GLUE_SDK_RETRY_MAX_ATTEMPTS})"
+                        ),
+                    )
+                }
             }
             .with_source(anyhow!("aws sdk error: {error:?}"))
         })?;
@@ -619,9 +678,16 @@ impl Catalog for GlueCatalog {
                     ErrorKind::TableAlreadyExists,
                     format!("Table {db_name}.{table_name} already exists"),
                 ),
+                CreateTableError::ConcurrentModificationException(_) => Error::new(
+                    ErrorKind::CatalogCommitConflicts,
+                    format!("Concurrent modification while creating table {db_name}.{table_name}"),
+                ),
                 _ => Error::new(
                     ErrorKind::Unexpected,
-                    "Operation failed for hitting aws sdk error".to_string(),
+                    format!(
+                        "Failed to create table {db_name}.{table_name} after applying AWS Glue SDK retry policy \
+                         (max_attempts={AWS_GLUE_SDK_RETRY_MAX_ATTEMPTS})"
+                    ),
                 ),
             }
             .with_source(anyhow!("aws sdk error: {error:?}"))
@@ -656,11 +722,8 @@ impl Catalog for GlueCatalog {
     ///
     /// # Errors
     /// Returns an error if:
-    /// - The namespace provided in `table` cannot be validated
-    /// or does not exist.
-    /// - The underlying database client encounters an error while
-    /// attempting to drop the table. This includes scenarios where
-    /// the table does not exist.
+    /// - The namespace provided in `table` cannot be validated.
+    /// - The table or database is missing, surfaced as [`ErrorKind::TableNotFound`].
     /// - Any network or communication error occurs with the database backend.
     async fn drop_table(&self, table: &TableIdent) -> Result<()> {
         let db_name = validate_namespace(table.namespace())?;
@@ -674,7 +737,21 @@ impl Catalog for GlueCatalog {
             .name(table_name);
         let builder = with_catalog_id!(builder, self.config);
 
-        builder.send().await.map_err(from_aws_sdk_error)?;
+        builder.send().await.map_err(|e| {
+            let error = e.into_service_error();
+            match error {
+                // Glue uses the same error for a missing table and a missing database.
+                DeleteTableError::EntityNotFoundException(_) => Error::new(
+                    ErrorKind::TableNotFound,
+                    format!("Table {db_name}.{table_name} not found"),
+                ),
+                _ => Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to drop table {db_name}.{table_name}"),
+                ),
+            }
+            .with_source(anyhow!("aws sdk error: {error:?}"))
+        })?;
 
         Ok(())
     }
@@ -844,7 +921,10 @@ impl Catalog for GlueCatalog {
                 ),
                 _ => Error::new(
                     ErrorKind::Unexpected,
-                    format!("Failed to register table {table_ident} due to AWS SDK error"),
+                    format!(
+                        "Failed to register table {table_ident} after applying AWS Glue SDK retry policy \
+                         (max_attempts={AWS_GLUE_SDK_RETRY_MAX_ATTEMPTS})"
+                    ),
                 ),
             }
             .with_source(anyhow!("aws sdk error: {error:?}"))
@@ -864,5 +944,291 @@ impl Catalog for GlueCatalog {
             self.load_table_with_version_id(&table_ident).await?;
         self.update_table_with_loaded_table(current_table, current_version_id, commit)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_config::retry::RetryConfig;
+    use aws_config::{BehaviorVersion, Region};
+    use aws_sdk_glue::config::Credentials;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use mockito::{Matcher, Server};
+    use serde_json::json;
+
+    use super::*;
+
+    fn test_catalog(server: &Server, warehouse: &str) -> GlueCatalog {
+        // Exercise the catalog's handling of the final SDK response without retry delays.
+        let sdk_config = aws_sdk_glue::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .endpoint_url(server.url())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .retry_config(RetryConfig::disabled())
+            .build();
+        GlueCatalog {
+            config: GlueCatalogConfig {
+                name: Some("test".to_string()),
+                uri: Some(server.url()),
+                catalog_id: None,
+                warehouse: warehouse.to_string(),
+                props: HashMap::new(),
+            },
+            client: GlueClient(aws_sdk_glue::Client::from_conf(sdk_config)),
+            file_io: FileIO::from_path(warehouse).unwrap().build().unwrap(),
+        }
+    }
+
+    fn table_creation(warehouse: &str) -> TableCreation {
+        TableCreation::builder()
+            .name("rows".to_string())
+            .location(warehouse.to_string())
+            .schema(
+                Schema::builder()
+                    .with_fields([NestedField::optional(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Long),
+                    )
+                    .into()])
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+    }
+
+    #[tokio::test]
+    async fn test_load_and_drop_missing_table_errors() {
+        let mut server = Server::new_async().await;
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = test_catalog(&server, directory.path().to_str().unwrap());
+        let table = TableIdent::from_strs(["db", "rows"]).unwrap();
+
+        for operation in ["GetTable", "DeleteTable"] {
+            let response = server
+                .mock("POST", "/")
+                .match_header("x-amz-target", format!("AWSGlue.{operation}").as_str())
+                .with_status(400)
+                .with_header("content-type", "application/x-amz-json-1.1")
+                .with_body(
+                    json!({"__type": "EntityNotFoundException", "Message": "missing"}).to_string(),
+                )
+                .create_async()
+                .await;
+            let error = if operation == "GetTable" {
+                catalog.load_table(&table).await.unwrap_err()
+            } else {
+                catalog.drop_table(&table).await.unwrap_err()
+            };
+            assert_eq!(error.kind(), ErrorKind::TableNotFound);
+            assert!(!error.retryable());
+            assert!(format!("{error:?}").contains("EntityNotFoundException"));
+            response.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_table_missing_metadata_requires_confirmed_absence() {
+        let mut server = Server::new_async().await;
+        let directory = tempfile::tempdir().unwrap();
+        let warehouse = directory.path().to_str().unwrap();
+        let catalog = test_catalog(&server, warehouse);
+        let table = TableIdent::from_strs(["db", "rows"]).unwrap();
+        let metadata_location = MetadataLocation::new_with_table_location(warehouse).to_string();
+        let response = server
+            .mock("POST", "/")
+            .match_header("x-amz-target", "AWSGlue.GetTable")
+            .with_header("content-type", "application/x-amz-json-1.1")
+            .with_body(
+                json!({"Table": {"Name": "rows", "VersionId": "7", "Parameters": {
+                    "table_type": "ICEBERG", "metadata_location": metadata_location
+                }}})
+                .to_string(),
+            )
+            .expect(3)
+            .create_async()
+            .await;
+
+        let missing = catalog.load_table(&table).await.unwrap_err();
+        assert_eq!(missing.kind(), ErrorKind::DataInvalid);
+        assert!(missing.message().contains("does not exist"));
+
+        catalog
+            .file_io
+            .new_output(&metadata_location)
+            .unwrap()
+            .write("invalid JSON".into())
+            .await
+            .unwrap();
+        let expected = TableMetadata::read_from(&catalog.file_io, &metadata_location)
+            .await
+            .unwrap_err();
+        let invalid = catalog.load_table(&table).await.unwrap_err();
+        assert_eq!(invalid.kind(), expected.kind());
+        assert_eq!(invalid.message(), expected.message());
+
+        let metadata = TableMetadataBuilder::from_table_creation(table_creation(warehouse))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        metadata
+            .write_to(&catalog.file_io, &metadata_location)
+            .await
+            .unwrap();
+        let (loaded, version) = catalog.load_table_with_version_id(&table).await.unwrap();
+        assert_eq!(loaded.metadata(), &metadata);
+        assert_eq!(version.as_deref(), Some("7"));
+        response.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_create_table_error_classification() {
+        let mut server = Server::new_async().await;
+        let directory = tempfile::tempdir().unwrap();
+        let warehouse = directory.path().to_str().unwrap();
+        let catalog = test_catalog(&server, warehouse);
+        for (aws_error, kind) in [
+            ("EntityNotFoundException", ErrorKind::NamespaceNotFound),
+            ("AlreadyExistsException", ErrorKind::TableAlreadyExists),
+            (
+                "ConcurrentModificationException",
+                ErrorKind::CatalogCommitConflicts,
+            ),
+            ("InvalidInputException", ErrorKind::Unexpected),
+        ] {
+            let response = server
+                .mock("POST", "/")
+                .match_header("x-amz-target", "AWSGlue.CreateTable")
+                .with_status(400)
+                .with_header("content-type", "application/x-amz-json-1.1")
+                .with_body(json!({"__type": aws_error, "Message": "test failure"}).to_string())
+                .create_async()
+                .await;
+            let error = catalog
+                .create_table(
+                    &NamespaceIdent::new("db".to_string()),
+                    table_creation(warehouse),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), kind, "{aws_error}");
+            assert!(!error.retryable(), "{aws_error}");
+            response.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_table_preserves_metadata_read_failures() {
+        use iceberg::io::{S3_DISABLE_CONFIG_LOAD, S3_DISABLE_EC2_METADATA, S3_PATH_STYLE_ACCESS};
+
+        let mut server = Server::new_async().await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut catalog = test_catalog(&server, directory.path().to_str().unwrap());
+        catalog.file_io = FileIO::from_path("s3://warehouse")
+            .unwrap()
+            .with_prop(S3_ENDPOINT, server.url())
+            .with_prop(S3_REGION, "us-east-1")
+            .with_prop(S3_ACCESS_KEY_ID, "test")
+            .with_prop(S3_SECRET_ACCESS_KEY, "test")
+            .with_prop(S3_PATH_STYLE_ACCESS, "true")
+            .with_prop(S3_DISABLE_CONFIG_LOAD, "true")
+            .with_prop(S3_DISABLE_EC2_METADATA, "true")
+            .build()
+            .unwrap();
+        let table_response = server
+            .mock("POST", "/")
+            .match_header("x-amz-target", "AWSGlue.GetTable")
+            .with_header("content-type", "application/x-amz-json-1.1")
+            .with_body(
+                json!({"Table": {"Name": "rows", "Parameters": {
+                    "table_type": "ICEBERG", "metadata_location": "s3://warehouse/metadata.json"
+                }}})
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let read_response = server
+            .mock("GET", "/warehouse/metadata.json")
+            .with_status(403)
+            .with_body("<Error><Code>AccessDenied</Code><Message>read denied</Message></Error>")
+            .create_async()
+            .await;
+        let stat_response = server
+            .mock("HEAD", "/warehouse/metadata.json")
+            .with_status(403)
+            .create_async()
+            .await;
+
+        let error = catalog
+            .load_table(&TableIdent::from_strs(["db", "rows"]).unwrap())
+            .await
+            .unwrap_err();
+        assert_ne!(error.kind(), ErrorKind::DataInvalid);
+        assert!(format!("{error:?}").contains("PermissionDenied"));
+        table_response.assert_async().await;
+        read_response.assert_async().await;
+        stat_response.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_table_error_classification() {
+        let mut server = Server::new_async().await;
+        let directory = tempfile::tempdir().unwrap();
+        let warehouse = directory.path().to_str().unwrap();
+        let catalog = test_catalog(&server, warehouse);
+        let table_ident = TableIdent::from_strs(["db", "rows"]).unwrap();
+        let metadata = TableMetadataBuilder::from_table_creation(table_creation(warehouse))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let table = Table::builder()
+            .identifier(table_ident.clone())
+            .metadata(metadata)
+            .metadata_location(MetadataLocation::new_with_table_location(warehouse).to_string())
+            .file_io(catalog.file_io())
+            .build()
+            .unwrap();
+        for (aws_error, kind, retryable) in [
+            ("EntityNotFoundException", ErrorKind::TableNotFound, false),
+            (
+                "ConcurrentModificationException",
+                ErrorKind::CatalogCommitConflicts,
+                true,
+            ),
+            ("InternalServiceException", ErrorKind::Unexpected, true),
+            ("OperationTimeoutException", ErrorKind::Unexpected, true),
+            (
+                "ResourceNumberLimitExceededException",
+                ErrorKind::Unexpected,
+                true,
+            ),
+            ("InvalidInputException", ErrorKind::Unexpected, false),
+        ] {
+            let response = server
+                .mock("POST", "/")
+                .match_header("x-amz-target", "AWSGlue.UpdateTable")
+                .match_body(Matcher::PartialJson(json!({"VersionId": "7"})))
+                .with_status(400)
+                .with_header("content-type", "application/x-amz-json-1.1")
+                .with_body(json!({"__type": aws_error, "Message": "test failure"}).to_string())
+                .create_async()
+                .await;
+            let commit = TableCommit::builder()
+                .ident(table_ident.clone())
+                .requirements(vec![])
+                .updates(vec![])
+                .build();
+            let error = catalog
+                .update_table_with_loaded_table(table.clone(), Some("7".to_string()), commit)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), kind, "{aws_error}");
+            assert_eq!(error.retryable(), retryable, "{aws_error}");
+            assert!(format!("{error:?}").contains(aws_error));
+            response.assert_async().await;
+        }
     }
 }

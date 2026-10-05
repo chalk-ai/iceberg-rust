@@ -38,7 +38,9 @@ use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::FileIO;
 use crate::metadata_columns::{get_metadata_field_id, is_metadata_column_name};
 use crate::runtime::spawn;
-use crate::spec::{DEFAULT_SCHEMA_NAME_MAPPING, DataContentType, NameMapping, SnapshotRef};
+use crate::spec::{
+    DEFAULT_SCHEMA_NAME_MAPPING, DataContentType, NameMapping, SchemaRef, SnapshotRef,
+};
 use crate::table::Table;
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind, Result};
@@ -569,6 +571,7 @@ pub(crate) struct BoundPredicates {
 /// Filter a pre-fetched list of [`FileScanTask`]s using a predicate, without re-reading manifests.
 pub fn filter_tasks_by_predicate(
     table: &Table,
+    schema: &SchemaRef,
     tasks: &[FileScanTask],
     predicate: &Predicate,
 ) -> Result<Vec<FileScanTask>> {
@@ -580,7 +583,7 @@ pub fn filter_tasks_by_predicate(
         return Ok(tasks.to_vec());
     }
 
-    let schema = table.metadata().current_schema();
+    // A reused name can identify different fields in the selected snapshot and current schema.
     let bound = predicate
         .clone()
         .rewrite_not()
@@ -966,9 +969,6 @@ pub mod tests {
                 ];
                 Arc::new(arrow_schema::Schema::new(fields))
             };
-            // x: [1, 1, 1, 1, ...]
-            let col1 = Arc::new(Int64Array::from_iter_values(vec![1; 1024])) as ArrayRef;
-
             let mut values = vec![2; 512];
             values.append(vec![3; 200].as_mut());
             values.append(vec![4; 300].as_mut());
@@ -1012,10 +1012,7 @@ pub mod tests {
             let values: BooleanArray = values.into();
             let col8 = Arc::new(values) as ArrayRef;
 
-            let to_write = RecordBatch::try_new(schema.clone(), vec![
-                col1, col2, col3, col4, col5, col6, col7, col8,
-            ])
-            .unwrap();
+            let other_columns = [col2, col3, col4, col5, col6, col7, col8];
 
             // Write the Parquet files
             let props = WriterProperties::builder()
@@ -1023,6 +1020,11 @@ pub mod tests {
                 .build();
 
             for n in 1..=3 {
+                // Identity partition metadata and the physical column describe the same value.
+                let mut columns =
+                    vec![Arc::new(Int64Array::from_iter_values(vec![n * 100; 1024])) as ArrayRef];
+                columns.extend(other_columns.iter().cloned());
+                let to_write = RecordBatch::try_new(schema.clone(), columns).unwrap();
                 let file = File::create(format!("{}/{}.parquet", &self.table_location, n)).unwrap();
                 let mut writer =
                     ArrowWriter::try_new(file, to_write.schema(), Some(props.clone())).unwrap();
@@ -1245,51 +1247,58 @@ pub mod tests {
             }
         }
 
-        pub async fn setup_deadlock_manifests(&mut self) {
+        // Multiple data manifests fill the bounded channel before a trailing delete manifest.
+        // Planning reads only manifests, so these data paths need no Parquet files.
+        pub async fn setup_many_data_manifests_with_trailing_deletes(
+            &mut self,
+            n_data_manifests: usize,
+            entries_per_manifest: usize,
+            delete_content: DataContentType,
+        ) {
             let current_snapshot = self.table.metadata().current_snapshot().unwrap();
-            let _parent_snapshot = current_snapshot
-                .parent_snapshot(self.table.metadata())
-                .unwrap();
             let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
             let current_partition_spec = self.table.metadata().default_partition_spec();
+            let partition = Struct::from_iter([Some(Literal::long(100))]);
 
-            // 1. Write DATA manifest with MULTIPLE entries to fill buffer
-            let mut writer = ManifestWriterBuilder::new(
-                self.next_manifest_file(),
-                Some(current_snapshot.snapshot_id()),
-                None,
-                current_schema.clone(),
-                current_partition_spec.as_ref().clone(),
-            )
-            .build_v2_data();
-
-            // Add 10 data entries
-            for i in 0..10 {
-                writer
-                    .add_entry(
-                        ManifestEntry::builder()
-                            .status(ManifestStatus::Added)
-                            .data_file(
-                                DataFileBuilder::default()
-                                    .partition_spec_id(0)
-                                    .content(DataContentType::Data)
-                                    .file_path(format!("{}/{}.parquet", &self.table_location, i))
-                                    .file_format(DataFileFormat::Parquet)
-                                    .file_size_in_bytes(100)
-                                    .record_count(1)
-                                    .partition(Struct::from_iter([Some(Literal::long(100))]))
-                                    .key_metadata(None)
-                                    .build()
-                                    .unwrap(),
-                            )
-                            .build(),
-                    )
-                    .unwrap();
+            let mut manifest_files = vec![];
+            for manifest_idx in 0..n_data_manifests {
+                let mut writer = ManifestWriterBuilder::new(
+                    self.next_manifest_file(),
+                    Some(current_snapshot.snapshot_id()),
+                    None,
+                    current_schema.clone(),
+                    current_partition_spec.as_ref().clone(),
+                )
+                .build_v2_data();
+                for entry_idx in 0..entries_per_manifest {
+                    writer
+                        .add_entry(
+                            ManifestEntry::builder()
+                                .status(ManifestStatus::Added)
+                                .data_file(
+                                    DataFileBuilder::default()
+                                        .partition_spec_id(0)
+                                        .content(DataContentType::Data)
+                                        .file_path(format!(
+                                            "{}/data_{manifest_idx}_{entry_idx}.parquet",
+                                            &self.table_location
+                                        ))
+                                        .file_format(DataFileFormat::Parquet)
+                                        .file_size_in_bytes(100)
+                                        .record_count(1)
+                                        .partition(partition.clone())
+                                        .key_metadata(None)
+                                        .build()
+                                        .unwrap(),
+                                )
+                                .build(),
+                        )
+                        .unwrap();
+                }
+                manifest_files.push(writer.write_manifest_file().await.unwrap());
             }
-            let data_manifest = writer.write_manifest_file().await.unwrap();
 
-            // 2. Write DELETE manifest
-            let mut writer = ManifestWriterBuilder::new(
+            let mut delete_writer = ManifestWriterBuilder::new(
                 self.next_manifest_file(),
                 Some(current_snapshot.snapshot_id()),
                 None,
@@ -1297,30 +1306,31 @@ pub mod tests {
                 current_partition_spec.as_ref().clone(),
             )
             .build_v2_deletes();
-
-            writer
+            delete_writer
                 .add_entry(
                     ManifestEntry::builder()
                         .status(ManifestStatus::Added)
                         .data_file(
                             DataFileBuilder::default()
                                 .partition_spec_id(0)
-                                .content(DataContentType::PositionDeletes)
-                                .file_path(format!("{}/del.parquet", &self.table_location))
+                                .content(delete_content)
+                                .file_path(format!("{}/deletes.parquet", &self.table_location))
                                 .file_format(DataFileFormat::Parquet)
                                 .file_size_in_bytes(100)
                                 .record_count(1)
-                                .partition(Struct::from_iter([Some(Literal::long(100))]))
+                                .partition(partition.clone())
+                                .equality_ids(
+                                    (delete_content == DataContentType::EqualityDeletes)
+                                        .then_some(vec![1]),
+                                )
                                 .build()
                                 .unwrap(),
                         )
                         .build(),
                 )
                 .unwrap();
-            let delete_manifest = writer.write_manifest_file().await.unwrap();
+            manifest_files.push(delete_writer.write_manifest_file().await.unwrap());
 
-            // Write to manifest list - DATA FIRST then DELETE
-            // This order is crucial for reproduction
             let mut manifest_list_write = ManifestListWriter::v2(
                 self.table
                     .file_io()
@@ -1331,9 +1341,18 @@ pub mod tests {
                 current_snapshot.sequence_number(),
             );
             manifest_list_write
-                .add_manifests(vec![data_manifest, delete_manifest].into_iter())
+                .add_manifests(manifest_files.into_iter())
                 .unwrap();
             manifest_list_write.close().await.unwrap();
+        }
+
+        pub async fn setup_deadlock_manifests(&mut self) {
+            self.setup_many_data_manifests_with_trailing_deletes(
+                1,
+                10,
+                DataContentType::PositionDeletes,
+            )
+            .await;
         }
     }
 
@@ -1457,6 +1476,291 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn test_plan_files_with_trailing_delete_manifest_does_not_deadlock() {
+        let mut fixture = TableTestFixture::new();
+        fixture
+            .setup_many_data_manifests_with_trailing_deletes(2, 8, DataContentType::EqualityDeletes)
+            .await;
+
+        let table_scan = fixture
+            .table
+            .scan()
+            .with_concurrency_limit(1)
+            .build()
+            .unwrap();
+
+        let plan = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            table_scan.plan_files(),
+        )
+        .await
+        .expect("plan_files() deadlocked (delete stage awaited before data-entry consumer spawned)")
+        .unwrap();
+        let tasks: Vec<_> = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            plan.try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("file scan task stream never terminated")
+        .unwrap();
+        assert_eq!(tasks.len(), 16);
+    }
+
+    #[tokio::test]
+    async fn test_scan_equality_delete_after_key_drop_and_name_reuse() {
+        use crate::arrow::schema_to_arrow_schema;
+        use crate::spec::{
+            FormatVersion, Operation, Snapshot, SortOrder, Summary, TableMetadataBuilder,
+        };
+
+        for reuse_name in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let location = directory.path().to_str().unwrap().to_string();
+            let file_io = FileIO::from_path(&location).unwrap().build().unwrap();
+            let original_schema = Schema::builder()
+                .with_fields([
+                    Arc::new(NestedField::optional(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                    Arc::new(NestedField::optional(
+                        2,
+                        "name",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ])
+                .build()
+                .unwrap();
+            let metadata = TableMetadataBuilder::new(
+                original_schema,
+                PartitionSpec::unpartition_spec(),
+                SortOrder::unsorted_order(),
+                location.clone(),
+                FormatVersion::V2,
+                HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+            let original_schema = metadata.current_schema().clone();
+            let data_batch = RecordBatch::try_new(
+                Arc::new(schema_to_arrow_schema(&original_schema).unwrap()),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                    Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+                ],
+            )
+            .unwrap();
+            let delete_batch = data_batch.project(&[0]).unwrap().slice(1, 1);
+            let mut manifests = Vec::new();
+            for (index, (content, batch)) in [
+                (DataContentType::Data, data_batch),
+                (DataContentType::EqualityDeletes, delete_batch),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let path = format!("{location}/{index}.parquet");
+                let mut writer =
+                    ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None)
+                        .unwrap();
+                writer.write(&batch).unwrap();
+                writer.close().unwrap();
+                let manifest_builder = ManifestWriterBuilder::new(
+                    file_io
+                        .new_output(format!("{location}/{index}.avro"))
+                        .unwrap(),
+                    Some(2),
+                    None,
+                    original_schema.clone(),
+                    PartitionSpec::unpartition_spec(),
+                );
+                let mut manifest = if content == DataContentType::Data {
+                    manifest_builder.build_v2_data()
+                } else {
+                    manifest_builder.build_v2_deletes()
+                };
+                let mut data_file = DataFileBuilder::default();
+                data_file
+                    .partition_spec_id(0)
+                    .content(content)
+                    .file_path(path.clone())
+                    .file_format(DataFileFormat::Parquet)
+                    .file_size_in_bytes(fs::metadata(&path).unwrap().len())
+                    .record_count(batch.num_rows() as u64)
+                    .partition(Struct::empty());
+                if content == DataContentType::Data {
+                    data_file
+                        .lower_bounds(HashMap::from([(1, Datum::int(1))]))
+                        .upper_bounds(HashMap::from([(1, Datum::int(2))]));
+                }
+                if content == DataContentType::EqualityDeletes {
+                    data_file.equality_ids(Some(vec![1]));
+                }
+                manifest
+                    .add_existing_entry(
+                        ManifestEntry::builder()
+                            .status(ManifestStatus::Existing)
+                            .snapshot_id(index as i64 + 1)
+                            .sequence_number(index as i64 + 1)
+                            .file_sequence_number(index as i64 + 1)
+                            .data_file(data_file.build().unwrap())
+                            .build(),
+                    )
+                    .unwrap();
+                manifests.push(manifest.write_manifest_file().await.unwrap());
+            }
+            let manifest_list = format!("{location}/manifest-list.avro");
+            let mut writer =
+                ManifestListWriter::v2(file_io.new_output(&manifest_list).unwrap(), 2, None, 2);
+            writer.add_manifests(manifests.into_iter()).unwrap();
+            writer.close().await.unwrap();
+            let snapshot = |id, sequence, schema_id, parent| {
+                Snapshot::builder()
+                    .with_snapshot_id(id)
+                    .with_parent_snapshot_id(parent)
+                    .with_sequence_number(sequence)
+                    .with_timestamp_ms(chrono::Utc::now().timestamp_millis())
+                    .with_manifest_list(manifest_list.clone())
+                    .with_schema_id(schema_id)
+                    .with_summary(Summary {
+                        operation: Operation::Append,
+                        additional_properties: HashMap::new(),
+                    })
+                    .build()
+            };
+            let metadata = metadata
+                .into_builder(None)
+                .set_branch_snapshot(snapshot(2, 2, original_schema.schema_id(), None), "main")
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+            let mut visible_fields = vec![original_schema.field_by_id(2).unwrap().clone()];
+            if reuse_name {
+                visible_fields.push(Arc::new(NestedField::optional(
+                    3,
+                    "id",
+                    Type::Primitive(PrimitiveType::String),
+                )));
+            }
+            let visible_schema = Schema::builder()
+                .with_fields(visible_fields)
+                .build()
+                .unwrap();
+            let metadata = metadata
+                .into_builder(None)
+                .add_current_schema(visible_schema)
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+            let schema_id = metadata.current_schema().schema_id();
+            // A new snapshot must use the post-drop schema; a schema-only change leaves the
+            // old snapshot's key definition available and would not exercise recovery.
+            let metadata = metadata
+                .into_builder(None)
+                .set_branch_snapshot(snapshot(3, 3, schema_id, Some(2)), "main")
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+            let table = Table::builder()
+                .metadata(metadata)
+                .identifier(TableIdent::from_strs(["db", "people"]).unwrap())
+                .file_io(file_io)
+                .build()
+                .unwrap();
+            let scan = table.scan().build().unwrap();
+            let tasks: Vec<_> = scan
+                .plan_files()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].deletes.len(), 1);
+            assert!(tasks[0].schema.field_by_id(1).is_some());
+            assert!(!tasks[0].project_field_ids.contains(&1));
+            let batches: Vec<_> = scan.to_arrow().await.unwrap().try_collect().await.unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            let batch = batches.iter().find(|batch| batch.num_rows() != 0).unwrap();
+            assert_eq!(
+                batch
+                    .column_by_name("name")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "Alice"
+            );
+            assert_eq!(batch.num_columns(), if reuse_name { 2 } else { 1 });
+            if reuse_name {
+                assert_eq!(batch.column_by_name("id").unwrap().null_count(), 1);
+            } else {
+                assert!(table.scan().select(["id"]).build().is_err());
+            }
+            let historical_scan = table.scan().snapshot_id(2).build().unwrap();
+            let historical_tasks: Vec<_> = historical_scan
+                .plan_files()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            for (id, expected_files) in [(1, 1), (3, 0)] {
+                let retained = super::filter_tasks_by_predicate(
+                    &table,
+                    &original_schema,
+                    &historical_tasks,
+                    &Reference::new("id").equal_to(Datum::int(id)),
+                )
+                .unwrap();
+                assert_eq!(retained.len(), expected_files);
+            }
+            let historical: Vec<_> = historical_scan
+                .to_arrow()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let historical = historical
+                .iter()
+                .find(|batch| batch.num_rows() != 0)
+                .unwrap();
+            assert_eq!(
+                historical
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                1
+            );
+        }
+    }
+
+    fn assert_partition_x_values(batches: &[RecordBatch], rows_per_file: usize) {
+        let mut actual = Vec::new();
+        for batch in batches {
+            let column = batch.column_by_name("x").unwrap();
+            assert_eq!(column.data_type(), &arrow_schema::DataType::Int64);
+            let values = column.as_primitive::<arrow_array::types::Int64Type>();
+            assert_eq!(values.null_count(), 0);
+            actual.extend(values.values().iter().copied());
+        }
+        actual.sort_unstable();
+        let expected = [vec![100; rows_per_file], vec![300; rows_per_file]].concat();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
     async fn test_open_parquet_no_deletions() {
         let mut fixture = TableTestFixture::new();
         fixture.setup_manifest_files().await;
@@ -1473,10 +1777,7 @@ pub mod tests {
 
         let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
 
-        let col = batches[0].column_by_name("x").unwrap();
-
-        let int64_arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(int64_arr.value(0), 1);
+        assert_partition_x_values(&batches, 1024);
     }
 
     #[tokio::test]
@@ -1514,7 +1815,16 @@ pub mod tests {
             .unwrap();
         let batch_2: Vec<_> = batch_stream.try_collect().await.unwrap();
 
-        assert_eq!(batch_1, batch_2);
+        let batches = [batch_1.clone(), batch_2.clone()].concat();
+        assert_partition_x_values(&batches, 1024);
+        let non_partition_columns = (1..8).collect::<Vec<_>>();
+        let without_partition = |batches: &[RecordBatch]| {
+            batches
+                .iter()
+                .map(|batch| batch.project(&non_partition_columns).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(without_partition(&batch_1), without_partition(&batch_2));
     }
 
     #[tokio::test]
@@ -1537,9 +1847,7 @@ pub mod tests {
 
         assert_eq!(batches[0].num_columns(), 2);
 
-        let col1 = batches[0].column_by_name("x").unwrap();
-        let int64_arr = col1.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(int64_arr.value(0), 1);
+        assert_partition_x_values(&batches, 1024);
 
         let col2 = batches[0].column_by_name("z").unwrap();
         let int64_arr = col2.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -1573,9 +1881,7 @@ pub mod tests {
 
         assert_eq!(batches[0].num_rows(), 512);
 
-        let col = batches[0].column_by_name("x").unwrap();
-        let int64_arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(int64_arr.value(0), 1);
+        assert_partition_x_values(&batches, 512);
 
         let col = batches[0].column_by_name("y").unwrap();
         let int64_arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -1601,9 +1907,7 @@ pub mod tests {
 
         assert_eq!(batches[0].num_rows(), 12);
 
-        let col = batches[0].column_by_name("x").unwrap();
-        let int64_arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(int64_arr.value(0), 1);
+        assert_partition_x_values(&batches, 12);
 
         let col = batches[0].column_by_name("y").unwrap();
         let int64_arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -1768,9 +2072,7 @@ pub mod tests {
         let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
         assert_eq!(batches[0].num_rows(), 500);
 
-        let col = batches[0].column_by_name("x").unwrap();
-        let expected_x = Arc::new(Int64Array::from_iter_values(vec![1; 500])) as ArrayRef;
-        assert_eq!(col, &expected_x);
+        assert_partition_x_values(&batches, 500);
 
         let col = batches[0].column_by_name("y").unwrap();
         let mut values = vec![];
@@ -1804,9 +2106,7 @@ pub mod tests {
         let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
         assert_eq!(batches[0].num_rows(), 1024);
 
-        let col = batches[0].column_by_name("x").unwrap();
-        let expected_x = Arc::new(Int64Array::from_iter_values(vec![1; 1024])) as ArrayRef;
-        assert_eq!(col, &expected_x);
+        assert_partition_x_values(&batches, 1024);
 
         let col = batches[0].column_by_name("y").unwrap();
         let mut values = vec![2; 512];
@@ -2008,9 +2308,7 @@ pub mod tests {
         // Verify we have 2 columns: x and _file
         assert_eq!(batches[0].num_columns(), 2);
 
-        // Verify the x column exists.
-        let x_col = batches[0].column_by_name("x").unwrap();
-        let x_arr = x_col.as_primitive::<arrow_array::types::Int64Type>();
+        assert_partition_x_values(&batches, 1024);
 
         // Verify the _file column exists
         let file_col = batches[0].column_by_name(RESERVED_COL_NAME_FILE);
@@ -2042,14 +2340,6 @@ pub mod tests {
             file_path.ends_with(".parquet"),
             "File path should end with .parquet, got: {file_path}"
         );
-        let expected_x = if file_path.ends_with("/1.parquet") {
-            100
-        } else if file_path.ends_with("/3.parquet") {
-            300
-        } else {
-            panic!("Unexpected file path: {file_path}");
-        };
-        assert_eq!(x_arr.value(0), expected_x);
     }
 
     #[tokio::test]
@@ -2271,14 +2561,21 @@ pub mod tests {
             "Column 5 should be y (duplicate)"
         );
 
+        assert_partition_x_values(&batches, 1024);
+        for batch in &batches {
+            assert_eq!(batch.column(0), batch.column(2));
+            assert_eq!(batch.column(1), batch.column(4));
+            assert_eq!(batch.column(3), batch.column(5));
+        }
+
         // Verify all columns have correct data types
         assert!(
             matches!(schema.field(0).data_type(), arrow_schema::DataType::Int64),
-            "Column x should be Int64"
+            "Column x should contain Int64 values"
         );
         assert!(
             matches!(schema.field(2).data_type(), arrow_schema::DataType::Int64),
-            "Column x (duplicate) should be Int64"
+            "Column x (duplicate) should contain Int64 values"
         );
         assert!(
             matches!(schema.field(3).data_type(), arrow_schema::DataType::Int64),

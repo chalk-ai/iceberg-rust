@@ -668,15 +668,18 @@ mod test {
 
     use arrow_array::{
         Array, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StringArray,
+        StringArray, Time64MicrosecondArray,
     };
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use crate::arrow::record_batch_transformer::{
         RecordBatchTransformer, RecordBatchTransformerBuilder,
     };
-    use crate::spec::{Literal, NestedField, PrimitiveType, Schema, Struct, Type};
+    use crate::spec::{
+        Literal, NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType, Schema, Struct,
+        Transform, Type,
+    };
 
     /// Helper to extract string values from either StringArray or RunEndEncoded<StringArray>
     /// Returns empty string for null values
@@ -742,6 +745,230 @@ mod test {
         ]);
 
         assert!(result.eq(&expected));
+    }
+
+    fn identity_partition_fill_schema() -> Schema {
+        Schema::builder()
+            .with_schema_id(3)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "part_col", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn identity_time_partition_fill_schema() -> Schema {
+        Schema::builder()
+            .with_schema_id(4)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "t", Type::Primitive(PrimitiveType::Time)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn source_record_batch_missing_partition_column() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![simple_field(
+                "id",
+                DataType::Int32,
+                false,
+                "1",
+            )])),
+            vec![Arc::new(Int32Array::from(vec![
+                Some(11),
+                Some(12),
+                Some(13),
+            ]))],
+        )
+        .unwrap()
+    }
+
+    fn source_record_batch_with_int64_time_column() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                simple_field("id", DataType::Int32, false, "1"),
+                simple_field("t", DataType::Int64, true, "2"),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(11), Some(12), Some(13)])),
+                Arc::new(Int64Array::from(vec![
+                    Some(1_000_000),
+                    None,
+                    Some(2_000_000),
+                ])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn identity_partition_target_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            simple_field("id", DataType::Int32, false, "1"),
+            simple_field("part_col", DataType::Int32, true, "2"),
+        ]))
+    }
+
+    fn identity_time_partition_target_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            simple_field("id", DataType::Int32, false, "1"),
+            simple_field("t", DataType::Time64(TimeUnit::Microsecond), true, "2"),
+        ]))
+    }
+
+    #[test]
+    fn processor_fills_missing_column_with_null_when_no_identity_partition_constant_exists() {
+        let snapshot_schema = Arc::new(identity_partition_fill_schema());
+        let projected_iceberg_field_ids = [1, 2];
+
+        let mut inst =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_iceberg_field_ids)
+                .build();
+
+        let result = inst
+            .process_record_batch(source_record_batch_missing_partition_column())
+            .unwrap();
+
+        let expected = RecordBatch::try_new(identity_partition_target_schema(), vec![
+            Arc::new(Int32Array::from(vec![Some(11), Some(12), Some(13)])),
+            Arc::new(Int32Array::from(vec![None, None, None])),
+        ])
+        .unwrap();
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn processor_fills_missing_column_from_identity_partition_constant() {
+        let snapshot_schema = Arc::new(identity_partition_fill_schema());
+        let projected_iceberg_field_ids = [1, 2];
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(snapshot_schema.clone())
+                .with_spec_id(1)
+                .add_partition_field("part_col", "part_col", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let partition_data =
+            Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Int(42)))]);
+
+        let mut inst =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_iceberg_field_ids)
+                .with_partition(partition_spec, partition_data)
+                .unwrap()
+                .build();
+
+        let result = inst
+            .process_record_batch(source_record_batch_missing_partition_column())
+            .unwrap();
+
+        let expected = RecordBatch::try_new(identity_partition_target_schema(), vec![
+            Arc::new(Int32Array::from(vec![Some(11), Some(12), Some(13)])),
+            Arc::new(Int32Array::from(vec![Some(42), Some(42), Some(42)])),
+        ])
+        .unwrap();
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn processor_promotes_int64_column_to_time64_microseconds() {
+        let snapshot_schema = Arc::new(identity_time_partition_fill_schema());
+        let projected_iceberg_field_ids = [1, 2];
+        let mut inst =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_iceberg_field_ids)
+                .build();
+
+        let result = inst
+            .process_record_batch(source_record_batch_with_int64_time_column())
+            .unwrap();
+
+        let expected = RecordBatch::try_new(identity_time_partition_target_schema(), vec![
+            Arc::new(Int32Array::from(vec![Some(11), Some(12), Some(13)])),
+            Arc::new(Time64MicrosecondArray::from(vec![
+                Some(1_000_000),
+                None,
+                Some(2_000_000),
+            ])),
+        ])
+        .unwrap();
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn processor_fills_missing_time_column_from_identity_partition_constant() {
+        let snapshot_schema = Arc::new(identity_time_partition_fill_schema());
+        let projected_iceberg_field_ids = [1, 2];
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(snapshot_schema.clone())
+                .with_spec_id(1)
+                .add_partition_field("t", "t", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let partition_data =
+            Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Long(1_000_000)))]);
+
+        let mut inst =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_iceberg_field_ids)
+                .with_partition(partition_spec, partition_data)
+                .unwrap()
+                .build();
+
+        let result = inst
+            .process_record_batch(source_record_batch_missing_partition_column())
+            .unwrap();
+
+        let expected = RecordBatch::try_new(identity_time_partition_target_schema(), vec![
+            Arc::new(Int32Array::from(vec![Some(11), Some(12), Some(13)])),
+            Arc::new(Time64MicrosecondArray::from(vec![
+                Some(1_000_000),
+                Some(1_000_000),
+                Some(1_000_000),
+            ])),
+        ])
+        .unwrap();
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn processor_does_not_fill_missing_column_from_non_identity_partition_constant() {
+        let snapshot_schema = Arc::new(identity_partition_fill_schema());
+        let projected_iceberg_field_ids = [1, 2];
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(snapshot_schema.clone())
+                .with_spec_id(1)
+                .add_partition_field("part_col", "part_col_bucket", Transform::Bucket(4))
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let partition_data =
+            Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Int(2)))]);
+
+        let mut inst =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_iceberg_field_ids)
+                .with_partition(partition_spec, partition_data)
+                .unwrap()
+                .build();
+
+        let result = inst
+            .process_record_batch(source_record_batch_missing_partition_column())
+            .unwrap();
+
+        let expected = RecordBatch::try_new(identity_partition_target_schema(), vec![
+            Arc::new(Int32Array::from(vec![Some(11), Some(12), Some(13)])),
+            Arc::new(Int32Array::from(vec![None, None, None])),
+        ])
+        .unwrap();
+
+        assert_eq!(result, expected);
     }
 
     #[test]

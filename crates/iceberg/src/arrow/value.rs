@@ -641,6 +641,14 @@ pub(crate) fn create_primitive_array_single_element(
             Ok(Arc::new(Date32Array::from(vec![*v])))
         }
         (DataType::Date32, None) => Ok(Arc::new(Date32Array::from(vec![Option::<i32>::None]))),
+        (DataType::Time64(TimeUnit::Microsecond), Some(PrimitiveLiteral::Long(v))) => {
+            Ok(Arc::new(Time64MicrosecondArray::from(vec![*v])))
+        }
+        (DataType::Time64(TimeUnit::Microsecond), None) => {
+            Ok(Arc::new(Time64MicrosecondArray::from(vec![
+                Option::<i64>::None,
+            ])))
+        }
         (DataType::Int64, Some(PrimitiveLiteral::Long(v))) => {
             Ok(Arc::new(Int64Array::from(vec![*v])))
         }
@@ -815,6 +823,12 @@ pub(crate) fn create_primitive_array_repeated(
                 Some(timezone) => Arc::new(array.with_timezone(timezone.as_ref())),
                 None => Arc::new(array),
             }
+        }
+        (DataType::Time64(TimeUnit::Microsecond), Some(PrimitiveLiteral::Long(value))) => {
+            Arc::new(Time64MicrosecondArray::from(vec![*value; num_rows]))
+        }
+        (DataType::Time64(TimeUnit::Microsecond), None) => {
+            Arc::new(Time64MicrosecondArray::from(vec![None; num_rows]))
         }
         (DataType::Int64, Some(PrimitiveLiteral::Long(value))) => {
             Arc::new(Int64Array::from(vec![*value; num_rows]))

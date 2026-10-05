@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+use aws_config::retry::RetryConfig;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_glue::config::Credentials;
 use aws_sdk_glue::types::{Database, DatabaseInput, StorageDescriptor, TableInput};
@@ -51,13 +52,17 @@ const TABLE_TYPE: &str = "table_type";
 /// Parameter value `table_type` for `TableInput`
 const ICEBERG: &str = "ICEBERG";
 
+/// Maximum attempts for AWS Glue SDK retries before surfacing an SDK error.
+pub(crate) const AWS_GLUE_SDK_RETRY_MAX_ATTEMPTS: u32 = 8;
+
 /// Creates an aws sdk configuration based on
 /// provided properties and an optional endpoint URL.
 pub(crate) async fn create_sdk_config(
     properties: &HashMap<String, String>,
     endpoint_uri: Option<&String>,
 ) -> SdkConfig {
-    let mut config = aws_config::defaults(BehaviorVersion::latest());
+    let mut config = aws_config::defaults(BehaviorVersion::latest())
+        .retry_config(RetryConfig::standard().with_max_attempts(AWS_GLUE_SDK_RETRY_MAX_ATTEMPTS));
 
     if let Some(endpoint) = endpoint_uri {
         config = config.endpoint_url(endpoint)
@@ -442,6 +447,16 @@ mod tests {
         let result = sdk_config.endpoint_url().unwrap();
 
         assert_eq!(result, endpoint_url);
+    }
+
+    #[tokio::test]
+    async fn test_config_uses_glue_retry_policy() {
+        let properties = HashMap::new();
+
+        let sdk_config = create_sdk_config(&properties, None).await;
+        let retry_config = sdk_config.retry_config().unwrap();
+
+        assert_eq!(AWS_GLUE_SDK_RETRY_MAX_ATTEMPTS, retry_config.max_attempts());
     }
 
     #[tokio::test]

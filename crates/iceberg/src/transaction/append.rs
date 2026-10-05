@@ -138,7 +138,10 @@ impl SnapshotProduceOperation for FastAppendOperation {
         Ok(manifest_list
             .entries()
             .iter()
-            .filter(|entry| entry.has_added_files() || entry.has_existing_files())
+            // Keep deletion entries available to consumers of the current manifest list.
+            .filter(|entry| {
+                entry.has_added_files() || entry.has_existing_files() || entry.has_deleted_files()
+            })
             .cloned()
             .collect())
     }
@@ -150,11 +153,111 @@ mod tests {
     use std::sync::Arc;
 
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, Struct,
+        DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, NestedField,
+        PrimitiveType, Schema, Struct, Type,
     };
     use crate::transaction::tests::make_v2_minimal_table;
-    use crate::transaction::{Transaction, TransactionAction};
-    use crate::{TableRequirement, TableUpdate};
+    use crate::transaction::{ApplyTransactionAction, Transaction, TransactionAction};
+    use crate::{Catalog, NamespaceIdent, TableCreation, TableRequirement, TableUpdate};
+
+    #[tokio::test]
+    async fn test_append_retains_deletion_only_manifests() -> anyhow::Result<()> {
+        use crate::CatalogBuilder;
+        use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+
+        let directory = tempfile::tempdir()?;
+        let warehouse = format!("file://{}", directory.path().display());
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "test",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+            )
+            .await?;
+        let namespace = NamespaceIdent::new("test".to_string());
+        catalog.create_namespace(&namespace, HashMap::new()).await?;
+        let schema = Schema::builder()
+            .with_fields([
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()?;
+        let mut table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("rows".to_string())
+                    .schema(schema)
+                    .build(),
+            )
+            .await?;
+        let file = |name: &str| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(format!("{warehouse}/{name}.parquet"))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(1)
+                .partition_spec_id(0)
+                .partition(Struct::empty())
+                .build()
+        };
+        let removed = file("removed")?;
+        let tx = Transaction::new(&table);
+        table = tx
+            .fast_append()
+            .add_data_files(vec![removed.clone()])
+            .apply(tx)?
+            .commit(&catalog)
+            .await?;
+        let tx = Transaction::new(&table);
+        table = tx
+            .overwrite()
+            .delete_data_files(vec![removed.clone()])
+            .apply(tx)?
+            .commit(&catalog)
+            .await?;
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let deletion_snapshot = snapshot.snapshot_id();
+        let list = snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await?;
+        assert_eq!(list.entries().len(), 1);
+        let deletion_manifest = list.entries()[0].clone();
+        assert!(deletion_manifest.has_deleted_files());
+        assert!(!deletion_manifest.has_added_files());
+        assert!(!deletion_manifest.has_existing_files());
+
+        let added = file("added")?;
+        let tx = Transaction::new(&table);
+        table = tx
+            .fast_append()
+            .add_data_files(vec![added.clone()])
+            .apply(tx)?
+            .commit(&catalog)
+            .await?;
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let list = snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await?;
+        assert!(list.entries().contains(&deletion_manifest));
+        let mut live_files = Vec::new();
+        for manifest_file in list.entries() {
+            let manifest = manifest_file.load_manifest(table.file_io()).await?;
+            for entry in manifest.entries() {
+                if entry.is_alive() {
+                    live_files.push(entry.data_file().clone());
+                } else {
+                    assert_eq!(entry.data_file(), &removed);
+                    assert_eq!(entry.snapshot_id(), Some(deletion_snapshot));
+                }
+            }
+        }
+        assert_eq!(live_files, vec![added]);
+        assert_eq!(
+            snapshot.summary().additional_properties["total-records"],
+            "1"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_empty_data_append_action() {
