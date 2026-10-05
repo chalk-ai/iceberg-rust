@@ -24,6 +24,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased — Chalk compatibility
+
+- Preserve Chalk's crate-native scan, equality-delete, transaction, summary, temporal and Glue retry regressions when replacing its vendored fork.
+- Require all 1,041 carried-forward native cases in the core/Glue/REST consumer CI lane and publish invocation evidence.
+
 ## [v0.8.0] - 2026-01-06
 
 ### Breaking Changes

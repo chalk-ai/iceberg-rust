@@ -20,12 +20,16 @@ use std::fmt::Debug;
 use anyhow::anyhow;
 use iceberg::{Error, ErrorKind};
 
+use crate::utils::AWS_GLUE_SDK_RETRY_MAX_ATTEMPTS;
+
 /// Format AWS SDK error into iceberg error
 pub(crate) fn from_aws_sdk_error<T>(error: aws_sdk_glue::error::SdkError<T>) -> Error
 where T: Debug {
     Error::new(
         ErrorKind::Unexpected,
-        "Operation failed for hitting aws sdk error".to_string(),
+        format!(
+            "Operation failed after applying AWS Glue SDK retry policy (max_attempts={AWS_GLUE_SDK_RETRY_MAX_ATTEMPTS})"
+        ),
     )
     .with_source(anyhow!("aws sdk error: {error:?}"))
 }
@@ -37,4 +41,23 @@ pub(crate) fn from_aws_build_error(error: aws_sdk_glue::error::BuildError) -> Er
         "Operation failed for hitting aws build error".to_string(),
     )
     .with_source(anyhow!("aws build error: {error:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+    use aws_sdk_glue::error::SdkError;
+
+    use super::*;
+
+    #[test]
+    fn test_aws_sdk_error_mentions_retry_policy() {
+        let sdk_error: SdkError<()> = SdkError::timeout_error(anyhow!("timed out"));
+
+        let error = from_aws_sdk_error(sdk_error);
+
+        assert!(error.message().contains(&format!(
+            "after applying AWS Glue SDK retry policy (max_attempts={AWS_GLUE_SDK_RETRY_MAX_ATTEMPTS})"
+        )));
+    }
 }

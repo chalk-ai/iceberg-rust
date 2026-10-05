@@ -642,6 +642,16 @@ impl ArrowReader {
                 (Some(lhs), Some(rhs)) if lhs == rhs => true,
                 (Some(PrimitiveType::Int), Some(PrimitiveType::Long)) => true,
                 (Some(PrimitiveType::Float), Some(PrimitiveType::Double)) => true,
+                // Iceberg time is stored as an int64 microsecond value. Some writers surface the
+                // Parquet leaf to Arrow as a plain Int64 rather than Time64(us); keep the column
+                // projected so RecordBatchTransformer can cast it to the table schema.
+                (Some(PrimitiveType::Long), Some(PrimitiveType::Time)) => true,
+                // Some Parquet/Arrow paths differ only in timestamp timezone annotation. Keep the
+                // physical column projected and let RecordBatchTransformer cast to the table schema.
+                (Some(PrimitiveType::Timestamp), Some(PrimitiveType::Timestamptz)) => true,
+                (Some(PrimitiveType::Timestamptz), Some(PrimitiveType::Timestamp)) => true,
+                (Some(PrimitiveType::TimestampNs), Some(PrimitiveType::TimestamptzNs)) => true,
+                (Some(PrimitiveType::TimestamptzNs), Some(PrimitiveType::TimestampNs)) => true,
                 (
                     Some(PrimitiveType::Decimal {
                         precision: file_precision,
@@ -1943,6 +1953,98 @@ message schema {
         )
         .expect("Some ProjectionMask");
         assert_eq!(mask, ProjectionMask::leaves(&parquet_schema, vec![0]));
+    }
+
+    #[test]
+    fn test_arrow_projection_mask_allows_long_file_column_for_time_field() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "t", Type::Primitive(PrimitiveType::Time)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("t", DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+
+        let message_type = "
+message schema {
+  required int32 id = 1;
+  optional int64 t = 2;
+}
+    ";
+        let parquet_type = parse_message_type(message_type).expect("should parse schema");
+        let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
+
+        let mask = ArrowReader::get_arrow_projection_mask(
+            &[1, 2],
+            &schema,
+            &parquet_schema,
+            &arrow_schema,
+            false,
+        )
+        .expect("Some ProjectionMask");
+        assert_eq!(mask, ProjectionMask::leaves(&parquet_schema, vec![0, 1]));
+    }
+
+    #[test]
+    fn test_arrow_projection_mask_allows_timestamp_timezone_annotation_mismatch() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "ts", Type::Primitive(PrimitiveType::Timestamp))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+
+        let message_type = "
+message schema {
+  required int32 id = 1;
+  optional int64 ts = 2;
+}
+    ";
+        let parquet_type = parse_message_type(message_type).expect("should parse schema");
+        let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
+
+        let mask = ArrowReader::get_arrow_projection_mask(
+            &[1, 2],
+            &schema,
+            &parquet_schema,
+            &arrow_schema,
+            false,
+        )
+        .expect("Some ProjectionMask");
+        assert_eq!(mask, ProjectionMask::leaves(&parquet_schema, vec![0, 1]));
     }
 
     #[tokio::test]

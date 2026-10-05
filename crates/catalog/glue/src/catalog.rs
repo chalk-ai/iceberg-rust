@@ -35,8 +35,9 @@ use iceberg::{
 
 use crate::error::{from_aws_build_error, from_aws_sdk_error};
 use crate::utils::{
-    convert_to_database, convert_to_glue_table, convert_to_namespace, create_sdk_config,
-    get_default_table_location, get_metadata_location, validate_namespace,
+    AWS_GLUE_SDK_RETRY_MAX_ATTEMPTS, convert_to_database, convert_to_glue_table,
+    convert_to_namespace, create_sdk_config, get_default_table_location, get_metadata_location,
+    validate_namespace,
 };
 use crate::{
     AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, with_catalog_id,
@@ -305,7 +306,10 @@ impl GlueCatalog {
                 .with_retryable(true),
                 _ => Error::new(
                     ErrorKind::Unexpected,
-                    format!("Operation failed for table: {table_ident} for hitting aws sdk error"),
+                    format!(
+                        "Operation failed for table {table_ident} after applying AWS Glue SDK retry policy \
+                         (max_attempts={AWS_GLUE_SDK_RETRY_MAX_ATTEMPTS})"
+                    ),
                 ),
             }
             .with_source(anyhow!("aws sdk error: {error:?}"))
@@ -621,7 +625,10 @@ impl Catalog for GlueCatalog {
                 ),
                 _ => Error::new(
                     ErrorKind::Unexpected,
-                    "Operation failed for hitting aws sdk error".to_string(),
+                    format!(
+                        "Failed to create table {db_name}.{table_name} after applying AWS Glue SDK retry policy \
+                         (max_attempts={AWS_GLUE_SDK_RETRY_MAX_ATTEMPTS})"
+                    ),
                 ),
             }
             .with_source(anyhow!("aws sdk error: {error:?}"))
@@ -844,7 +851,10 @@ impl Catalog for GlueCatalog {
                 ),
                 _ => Error::new(
                     ErrorKind::Unexpected,
-                    format!("Failed to register table {table_ident} due to AWS SDK error"),
+                    format!(
+                        "Failed to register table {table_ident} after applying AWS Glue SDK retry policy \
+                         (max_attempts={AWS_GLUE_SDK_RETRY_MAX_ATTEMPTS})"
+                    ),
                 ),
             }
             .with_source(anyhow!("aws sdk error: {error:?}"))

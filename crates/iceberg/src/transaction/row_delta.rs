@@ -383,12 +383,6 @@ mod tests {
     /// - The surviving file appears as EXISTING with correct sequence numbers.
     /// - The new file appears as ADDED.
     /// - The snapshot summary counts `deleted-data-files = 1`.
-    // TODO: this test has never run (the lib-test target did not compile until the
-    // CHA-10390 fix made it build) and fails on the summary assertion: the snapshot
-    // reports deleted-data-files = 2 for a single removed file. Needs triage by the
-    // row-delta/overwrite owners — the double-count is either a summary bug or a
-    // wrong expectation.
-    #[ignore = "pre-existing failure: summary double-counts deleted data files; see TODO above"]
     #[tokio::test]
     async fn test_row_delta_cow_manifest_rewrite() {
         let base_table = make_v2_minimal_table();

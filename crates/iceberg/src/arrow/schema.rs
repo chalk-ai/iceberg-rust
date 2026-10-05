@@ -1110,7 +1110,7 @@ pub fn datum_to_arrow_type_with_ree(datum: &Datum) -> DataType {
         PrimitiveType::Float => make_ree(DataType::Float32),
         PrimitiveType::Double => make_ree(DataType::Float64),
         PrimitiveType::Date => make_ree(DataType::Date32),
-        PrimitiveType::Time => make_ree(DataType::Int64),
+        PrimitiveType::Time => make_ree(DataType::Time64(TimeUnit::Microsecond)),
         PrimitiveType::Timestamp => make_ree(DataType::Int64),
         PrimitiveType::Timestamptz => make_ree(DataType::Int64),
         PrimitiveType::TimestampNs => make_ree(DataType::Int64),

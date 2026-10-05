@@ -2384,13 +2384,14 @@ mod tests {
 
         let config_mock = create_config_mock(&mut server).await;
 
+        // Transaction refresh must load the same table identity as its starting metadata.
         let load_table_mock = server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
             .with_status(200)
             .with_body_from_file(format!(
                 "{}/testdata/{}",
                 env!("CARGO_MANIFEST_DIR"),
-                "load_table_response.json"
+                "create_table_response.json"
             ))
             .create_async()
             .await;
@@ -2518,13 +2519,14 @@ mod tests {
 
         let config_mock = create_config_mock(&mut server).await;
 
+        // Transaction refresh must load the same table identity as its starting metadata.
         let load_table_mock = server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
             .with_status(200)
             .with_body_from_file(format!(
                 "{}/testdata/{}",
                 env!("CARGO_MANIFEST_DIR"),
-                "load_table_response.json"
+                "create_table_response.json"
             ))
             .create_async()
             .await;

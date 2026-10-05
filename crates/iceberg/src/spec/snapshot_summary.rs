@@ -329,11 +329,9 @@ where T: PartialOrd + Default + ToString {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn update_snapshot_summaries(
-    summary: Summary,
+    mut summary: Summary,
     previous_summary: Option<&Summary>,
-    truncate_full_table: bool,
 ) -> Result<Summary> {
     // Validate that the operation is supported
     if summary.operation != Operation::Append
@@ -346,25 +344,13 @@ pub(crate) fn update_snapshot_summaries(
         ));
     }
 
-    let mut summary = match previous_summary {
-        Some(prev_summary) if truncate_full_table && summary.operation == Operation::Overwrite => {
-            truncate_table_summary(summary, prev_summary)
-                .map_err(|err| {
-                    Error::new(ErrorKind::Unexpected, "Failed to truncate table summary.")
-                        .with_source(err)
-                })
-                .unwrap()
-        }
-        _ => summary,
-    };
-
     update_totals(
         &mut summary,
         previous_summary,
         TOTAL_DATA_FILES,
         ADDED_DATA_FILES,
         DELETED_DATA_FILES,
-    );
+    )?;
 
     update_totals(
         &mut summary,
@@ -372,7 +358,7 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_DELETE_FILES,
         ADDED_DELETE_FILES,
         REMOVED_DELETE_FILES,
-    );
+    )?;
 
     update_totals(
         &mut summary,
@@ -380,7 +366,7 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_RECORDS,
         ADDED_RECORDS,
         DELETED_RECORDS,
-    );
+    )?;
 
     update_totals(
         &mut summary,
@@ -388,7 +374,7 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_FILE_SIZE,
         ADDED_FILE_SIZE,
         REMOVED_FILE_SIZE,
-    );
+    )?;
 
     update_totals(
         &mut summary,
@@ -396,7 +382,7 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_POSITION_DELETES,
         ADDED_POSITION_DELETES,
         REMOVED_POSITION_DELETES,
-    );
+    )?;
 
     update_totals(
         &mut summary,
@@ -404,116 +390,66 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_EQUALITY_DELETES,
         ADDED_EQUALITY_DELETES,
         REMOVED_EQUALITY_DELETES,
-    );
+    )?;
     Ok(summary)
 }
 
-#[allow(dead_code)]
-fn get_prop(previous_summary: &Summary, prop: &str) -> Result<i32> {
-    let value_str = previous_summary
+fn summary_count(summary: &Summary, property: &str) -> Result<Option<u64>> {
+    summary
         .additional_properties
-        .get(prop)
-        .map(String::as_str)
-        .unwrap_or("0");
-    value_str.parse::<i32>().map_err(|err| {
-        Error::new(
-            ErrorKind::Unexpected,
-            "Failed to parse value from previous summary property.",
-        )
-        .with_source(err)
-    })
+        .get(property)
+        .map(|value| {
+            value.parse::<u64>().map_err(|err| {
+                Error::new(ErrorKind::DataInvalid, "Invalid snapshot summary count")
+                    .with_context("property", property)
+                    .with_context("value", value)
+                    .with_source(err)
+            })
+        })
+        .transpose()
 }
 
-#[allow(dead_code)]
-fn truncate_table_summary(mut summary: Summary, previous_summary: &Summary) -> Result<Summary> {
-    for prop in [
-        TOTAL_DATA_FILES,
-        TOTAL_DELETE_FILES,
-        TOTAL_RECORDS,
-        TOTAL_FILE_SIZE,
-        TOTAL_POSITION_DELETES,
-        TOTAL_EQUALITY_DELETES,
-    ] {
-        summary
-            .additional_properties
-            .insert(prop.to_string(), "0".to_string());
-    }
-
-    let value = get_prop(previous_summary, TOTAL_DATA_FILES)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(DELETED_DATA_FILES.to_string(), value.to_string());
-    }
-    let value = get_prop(previous_summary, TOTAL_DELETE_FILES)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(REMOVED_DELETE_FILES.to_string(), value.to_string());
-    }
-    let value = get_prop(previous_summary, TOTAL_RECORDS)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(DELETED_RECORDS.to_string(), value.to_string());
-    }
-    let value = get_prop(previous_summary, TOTAL_FILE_SIZE)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(REMOVED_FILE_SIZE.to_string(), value.to_string());
-    }
-
-    let value = get_prop(previous_summary, TOTAL_POSITION_DELETES)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(REMOVED_POSITION_DELETES.to_string(), value.to_string());
-    }
-
-    let value = get_prop(previous_summary, TOTAL_EQUALITY_DELETES)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(REMOVED_EQUALITY_DELETES.to_string(), value.to_string());
-    }
-
-    Ok(summary)
-}
-
-#[allow(dead_code)]
 fn update_totals(
     summary: &mut Summary,
     previous_summary: Option<&Summary>,
     total_property: &str,
     added_property: &str,
     removed_property: &str,
-) {
-    let previous_total = previous_summary.map_or(0, |previous_summary| {
-        previous_summary
-            .additional_properties
-            .get(total_property)
-            .map_or(0, |value| value.parse::<u64>().unwrap())
-    });
+) -> Result<()> {
+    let added = summary_count(summary, added_property)?.unwrap_or(0);
+    let removed = summary_count(summary, removed_property)?.unwrap_or(0);
+    let previous_total = match previous_summary {
+        None => 0,
+        Some(previous) => match summary_count(previous, total_property)? {
+            Some(total) => total,
+            None => {
+                // Totals are optional: an omitted prior count is unknown, whereas
+                // a table with no prior snapshot is known to contain no files.
+                summary.additional_properties.remove(total_property);
+                return Ok(());
+            }
+        },
+    };
 
-    let mut new_total = previous_total;
-    if let Some(value) = summary
-        .additional_properties
-        .get(added_property)
-        .map(|value| value.parse::<u64>().unwrap())
-    {
-        new_total += value;
-    }
-    if let Some(value) = summary
-        .additional_properties
-        .get(removed_property)
-        .map(|value| value.parse::<u64>().unwrap())
-    {
-        new_total -= value;
-    }
+    // An overwrite removes only the supplied files, not necessarily the whole
+    // table. Subtract first so replacing files cannot overflow an intermediate sum.
+    let new_total = previous_total
+        .checked_sub(removed)
+        .and_then(|remaining| remaining.checked_add(added))
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Snapshot summary count out of range",
+            )
+            .with_context("property", total_property)
+            .with_context("previous", previous_total.to_string())
+            .with_context("added", added.to_string())
+            .with_context("removed", removed.to_string())
+        })?;
     summary
         .additional_properties
         .insert(total_property.to_string(), new_total.to_string());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -567,7 +503,7 @@ mod tests {
             additional_properties: new_props,
         };
 
-        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary)).unwrap();
 
         assert_eq!(
             updated.additional_properties.get(TOTAL_DATA_FILES).unwrap(),
@@ -604,115 +540,100 @@ mod tests {
         );
     }
 
+    fn summary(operation: Operation, properties: &[(&str, &str)]) -> Summary {
+        Summary {
+            operation,
+            additional_properties: properties
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        }
+    }
+
     #[test]
-    fn test_truncate_table_summary() {
-        let prev_props: HashMap<String, String> = [
-            (TOTAL_DATA_FILES.to_string(), "10".to_string()),
-            (TOTAL_DELETE_FILES.to_string(), "5".to_string()),
-            (TOTAL_RECORDS.to_string(), "100".to_string()),
-            (TOTAL_FILE_SIZE.to_string(), "1000".to_string()),
-            (TOTAL_POSITION_DELETES.to_string(), "3".to_string()),
-            (TOTAL_EQUALITY_DELETES.to_string(), "2".to_string()),
-        ]
-        .into_iter()
-        .collect();
+    fn test_summary_missing_totals_stay_absent_after_delete_and_reinsert() {
+        let previous = summary(Operation::Append, &[(TOTAL_DELETE_FILES, "2")]);
+        let deleted = update_snapshot_summaries(
+            summary(Operation::Overwrite, &[
+                (DELETED_DATA_FILES, "1"),
+                (DELETED_RECORDS, "3"),
+            ]),
+            Some(&previous),
+        )
+        .unwrap();
+        let reinserted = update_snapshot_summaries(
+            summary(Operation::Overwrite, &[
+                (ADDED_DATA_FILES, "1"),
+                (ADDED_RECORDS, "2"),
+            ]),
+            Some(&deleted),
+        )
+        .unwrap();
+        for result in [&deleted, &reinserted] {
+            assert!(!result.additional_properties.contains_key(TOTAL_DATA_FILES));
+            assert!(!result.additional_properties.contains_key(TOTAL_RECORDS));
+            assert_eq!(result.additional_properties[TOTAL_DELETE_FILES], "2");
+        }
+    }
 
-        let previous_summary = Summary {
-            operation: Operation::Overwrite,
-            additional_properties: prev_props,
-        };
+    #[test]
+    fn test_summary_initial_snapshot_starts_at_zero() {
+        let result = update_snapshot_summaries(
+            summary(Operation::Append, &[
+                (ADDED_DATA_FILES, "1"),
+                (ADDED_RECORDS, "3"),
+            ]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.additional_properties[TOTAL_DATA_FILES], "1");
+        assert_eq!(result.additional_properties[TOTAL_RECORDS], "3");
+        assert_eq!(result.additional_properties[TOTAL_DELETE_FILES], "0");
+    }
 
-        let mut new_props = HashMap::new();
-        new_props.insert("dummy".to_string(), "value".to_string());
-        let summary = Summary {
-            operation: Operation::Overwrite,
-            additional_properties: new_props,
-        };
+    #[test]
+    fn test_summary_large_overwrite_counts() {
+        let previous = summary(Operation::Append, &[
+            (TOTAL_DATA_FILES, "4294967296"),
+            (TOTAL_FILE_SIZE, "18446744073709551615"),
+        ]);
+        let result = update_snapshot_summaries(
+            summary(Operation::Overwrite, &[
+                (DELETED_DATA_FILES, "1"),
+                (ADDED_DATA_FILES, "2"),
+                (REMOVED_FILE_SIZE, "4294967296"),
+                (ADDED_FILE_SIZE, "4294967296"),
+            ]),
+            Some(&previous),
+        )
+        .unwrap();
+        assert_eq!(result.additional_properties[TOTAL_DATA_FILES], "4294967297");
+        assert_eq!(
+            result.additional_properties[TOTAL_FILE_SIZE],
+            u64::MAX.to_string()
+        );
+    }
 
-        let truncated = truncate_table_summary(summary, &previous_summary).unwrap();
-
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(TOTAL_DATA_FILES)
-                .unwrap(),
-            "0"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(TOTAL_DELETE_FILES)
-                .unwrap(),
-            "0"
-        );
-        assert_eq!(
-            truncated.additional_properties.get(TOTAL_RECORDS).unwrap(),
-            "0"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(TOTAL_FILE_SIZE)
-                .unwrap(),
-            "0"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(TOTAL_POSITION_DELETES)
-                .unwrap(),
-            "0"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(TOTAL_EQUALITY_DELETES)
-                .unwrap(),
-            "0"
-        );
-
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(DELETED_DATA_FILES)
-                .unwrap(),
-            "10"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(REMOVED_DELETE_FILES)
-                .unwrap(),
-            "5"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(DELETED_RECORDS)
-                .unwrap(),
-            "100"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(REMOVED_FILE_SIZE)
-                .unwrap(),
-            "1000"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(REMOVED_POSITION_DELETES)
-                .unwrap(),
-            "3"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(REMOVED_EQUALITY_DELETES)
-                .unwrap(),
-            "2"
-        );
+    #[test]
+    fn test_summary_invalid_counts_return_errors() {
+        for (previous, added, removed) in [
+            ("invalid", "1", "0"),
+            ("-1", "1", "0"),
+            ("18446744073709551616", "1", "0"),
+            ("1", "invalid", "0"),
+            ("1", "0", "invalid"),
+            ("0", "0", "1"),
+            ("18446744073709551615", "1", "0"),
+        ] {
+            let result = update_snapshot_summaries(
+                summary(Operation::Overwrite, &[
+                    (ADDED_DATA_FILES, added),
+                    (DELETED_DATA_FILES, removed),
+                ]),
+                Some(&summary(Operation::Append, &[(TOTAL_DATA_FILES, previous)])),
+            );
+            assert_eq!(result.unwrap_err().kind(), ErrorKind::DataInvalid);
+        }
     }
 
     #[test]

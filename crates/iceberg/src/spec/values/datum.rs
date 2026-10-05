@@ -1130,6 +1130,27 @@ impl Datum {
                     (PrimitiveLiteral::Long(val), _, PrimitiveType::Timestamptz) => {
                         Ok(Datum::timestamptz_micros(*val))
                     }
+                    // Date predicate literals bind to timestamp columns at midnight UTC.
+                    (
+                        PrimitiveLiteral::Int(val),
+                        PrimitiveType::Date,
+                        PrimitiveType::Timestamp | PrimitiveType::Timestamptz,
+                    ) => {
+                        const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
+                        let micros =
+                            i64::from(*val).checked_mul(MICROS_PER_DAY).ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::DataInvalid,
+                                    format!(
+                                        "Date value {val} days exceeds timestamp microsecond range"
+                                    ),
+                                )
+                            })?;
+                        Ok(Datum::new(
+                            target_primitive_type.clone(),
+                            PrimitiveLiteral::Long(micros),
+                        ))
+                    }
                     // Let's wait with nano's until this clears up: https://github.com/apache/iceberg/pull/11775
                     (PrimitiveLiteral::Int128(val), _, PrimitiveType::Long) => {
                         Ok(Datum::i128_to_i64(*val))

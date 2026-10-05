@@ -417,17 +417,41 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         for data_file in snapshot_produce_operation.removed_data_files() {
-            summary_collector.remove_file(
-                data_file,
-                table_metadata.current_schema().clone(),
-                table_metadata.default_partition_spec().clone(),
-            );
+            let partition_spec = table_metadata
+                .partition_spec_by_id(data_file.partition_spec_id())
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Removed data file references an unknown partition spec",
+                    )
+                    .with_context("file", data_file.file_path())
+                    .with_context("spec_id", data_file.partition_spec_id().to_string())
+                })?;
+            // A removed file retains its original partition tuple. Schema evolution
+            // can also remove or promote its source fields, so use a retained schema
+            // that still describes that tuple rather than reinterpreting its values.
+            let schema = std::iter::once(table_metadata.current_schema())
+                .chain(table_metadata.schemas_iter())
+                .find(|schema| {
+                    partition_spec
+                        .partition_type(schema)
+                        .and_then(|partition_type| {
+                            Self::validate_partition_value(data_file.partition(), &partition_type)
+                        })
+                        .is_ok()
+                })
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Removed data file partition is incompatible with retained table schemas",
+                    )
+                    .with_context("file", data_file.file_path())
+                })?;
+            summary_collector.remove_file(data_file, schema.clone(), partition_spec.clone());
         }
 
-        let previous_snapshot = table_metadata
-            .snapshot_by_id(self.snapshot_id)
-            .and_then(|snapshot| snapshot.parent_snapshot_id())
-            .and_then(|parent_id| table_metadata.snapshot_by_id(parent_id));
+        // The new snapshot is not in table metadata until this action commits.
+        let previous_snapshot = table_metadata.current_snapshot();
 
         let mut additional_properties = summary_collector.build();
         additional_properties.extend(self.snapshot_properties.clone());
@@ -437,11 +461,7 @@ impl<'a> SnapshotProducer<'a> {
             additional_properties,
         };
 
-        update_snapshot_summaries(
-            summary,
-            previous_snapshot.map(|s| s.summary()),
-            snapshot_produce_operation.operation() == Operation::Overwrite,
-        )
+        update_snapshot_summaries(summary, previous_snapshot.map(|s| s.summary()))
     }
 
     fn generate_manifest_list_file_path(&self, attempt: i64) -> String {
