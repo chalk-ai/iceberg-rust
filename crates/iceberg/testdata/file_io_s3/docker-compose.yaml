@@ -17,7 +17,9 @@
 
 services:
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-05-24T17-08-30Z
+    build:
+      context: ../../../test_utils/testdata/minio
+      target: minio
     expose:
       - 9000
       - 9001

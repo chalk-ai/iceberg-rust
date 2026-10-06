@@ -25,7 +25,7 @@ use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::object_cache::ObjectCache;
 use crate::scan::{
     BoundPredicates, ExpressionEvaluatorCache, FileScanTask, ManifestEvaluatorCache,
-    PartitionFilterCache,
+    PartitionFilterCache, schema_with_equality_delete_fields,
 };
 use crate::spec::{
     ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, NameMapping,
@@ -44,6 +44,7 @@ pub(crate) struct ManifestFileContext {
     bound_predicates: Option<Arc<BoundPredicates>>,
     object_cache: Arc<ObjectCache>,
     snapshot_schema: SchemaRef,
+    table_metadata: TableMetadataRef,
     expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
     case_sensitive: bool,
     name_mapping: Option<Arc<NameMapping>>,
@@ -60,6 +61,7 @@ pub(crate) struct ManifestEntryContext {
     pub bound_predicates: Option<Arc<BoundPredicates>>,
     pub partition_spec_id: i32,
     pub snapshot_schema: SchemaRef,
+    table_metadata: TableMetadataRef,
     pub case_sensitive: bool,
     pub name_mapping: Option<Arc<NameMapping>>,
     pub partition_spec: Option<PartitionSpecRef>,
@@ -79,6 +81,7 @@ impl ManifestFileContext {
             manifest_file,
             bound_predicates,
             snapshot_schema,
+            table_metadata,
             field_ids,
             mut sender,
             expression_evaluator_cache,
@@ -98,6 +101,7 @@ impl ManifestFileContext {
                 partition_spec_id: manifest_file.partition_spec_id,
                 bound_predicates: bound_predicates.clone(),
                 snapshot_schema: snapshot_schema.clone(),
+                table_metadata: table_metadata.clone(),
                 case_sensitive: self.case_sensitive,
                 name_mapping: name_mapping.clone(),
                 partition_spec: partition_spec.clone(),
@@ -124,6 +128,14 @@ impl ManifestEntryContext {
             self.manifest_entry.sequence_number(),
         );
 
+        let schema = schema_with_equality_delete_fields(
+            self.snapshot_schema.clone(),
+            &self.table_metadata,
+            deletes
+                .iter()
+                .flat_map(|delete| delete.equality_ids.iter().flatten().copied()),
+        )?;
+
         Ok(FileScanTask {
             start: 0,
             length: self.manifest_entry.file_size_in_bytes(),
@@ -132,7 +144,7 @@ impl ManifestEntryContext {
             data_file_path: self.manifest_entry.file_path().to_string(),
             data_file_format: self.manifest_entry.file_format(),
 
-            schema: self.snapshot_schema.clone(),
+            schema,
             project_field_ids: self.field_ids.to_vec(),
             predicate: self
                 .bound_predicates
@@ -141,7 +153,7 @@ impl ManifestEntryContext {
 
             deletes,
 
-            // Include partition data and spec from manifest entry
+            // Each file retains the spec under which its partition values were written.
             partition: Some(self.manifest_entry.data_file.partition.clone()),
             partition_spec: self.partition_spec.clone(),
             name_mapping: self.name_mapping.clone(),
@@ -288,6 +300,7 @@ impl PlanContext {
             sender,
             object_cache: self.object_cache.clone(),
             snapshot_schema: self.snapshot_schema.clone(),
+            table_metadata: self.table_metadata.clone(),
             field_ids: self.field_ids.clone(),
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
             case_sensitive: self.case_sensitive,

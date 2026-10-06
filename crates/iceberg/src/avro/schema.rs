@@ -234,8 +234,9 @@ impl SchemaVisitor for SchemaToAvroSchema {
             PrimitiveType::TimestampNs => AvroSchema::TimestampNanos,
             PrimitiveType::TimestamptzNs => AvroSchema::TimestampNanos,
             PrimitiveType::String => AvroSchema::String,
-            PrimitiveType::Uuid => AvroSchema::Uuid,
-            PrimitiveType::Fixed(len) => avro_fixed_schema((*len) as usize)?,
+            // Iceberg requires fixed(16); AvroSchema::Uuid writes a string representation.
+            PrimitiveType::Uuid => avro_fixed_schema(16, Some("uuid"))?,
+            PrimitiveType::Fixed(len) => avro_fixed_schema((*len) as usize, None)?,
             PrimitiveType::Binary => AvroSchema::Bytes,
             PrimitiveType::Decimal { precision, scale } => {
                 avro_decimal_schema(*precision as usize, *scale as usize)?
@@ -271,13 +272,16 @@ fn avro_record_schema(name: &str, fields: Vec<AvroRecordField>) -> Result<AvroSc
     }))
 }
 
-pub(crate) fn avro_fixed_schema(len: usize) -> Result<AvroSchema> {
+pub(crate) fn avro_fixed_schema(len: usize, logical_type: Option<&str>) -> Result<AvroSchema> {
+    let attributes = logical_type
+        .map(|logical_type| BTreeMap::from([(LOGICAL_TYPE.to_string(), Value::from(logical_type))]))
+        .unwrap_or_default();
     Ok(AvroSchema::Fixed(FixedSchema {
         name: Name::new(format!("fixed_{len}").as_str())?,
         aliases: None,
         doc: None,
         size: len,
-        attributes: Default::default(),
+        attributes,
         default: None,
     }))
 }
@@ -1210,6 +1214,44 @@ mod tests {
         assert_eq!(
             iceberg_type,
             converter.primitive(&avro_schema).unwrap().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_uuid_writer_uses_fixed_sixteen_byte_encoding() {
+        let mut converter = SchemaToAvroSchema {
+            schema: "uuid".to_string(),
+        };
+        let schema = converter
+            .primitive(&PrimitiveType::Uuid)
+            .unwrap()
+            .unwrap_left();
+        assert_eq!(
+            serde_json::to_value(&schema).unwrap(),
+            serde_json::json!({
+                "type": "fixed", "name": "fixed_16", "size": 16, "logicalType": "uuid"
+            })
+        );
+        let bytes = uuid::Uuid::parse_str("f79c3e09-677c-4bbd-a479-3f349cb785e7")
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let encoded = apache_avro::to_avro_datum(
+            &schema,
+            apache_avro::types::Value::Fixed(16, bytes.clone()),
+        )
+        .unwrap();
+        assert_eq!(encoded, bytes);
+
+        let fixed = converter
+            .primitive(&PrimitiveType::Fixed(16))
+            .unwrap()
+            .unwrap_left();
+        assert!(
+            serde_json::to_value(fixed)
+                .unwrap()
+                .get("logicalType")
+                .is_none()
         );
     }
 }

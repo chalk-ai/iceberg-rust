@@ -673,7 +673,7 @@ impl Catalog for RestCatalog {
             }
             StatusCode::CONFLICT => {
                 return Err(Error::new(
-                    ErrorKind::Unexpected,
+                    ErrorKind::TableAlreadyExists,
                     "The table already exists",
                 ));
             }
@@ -2365,14 +2365,10 @@ mod tests {
             .create_table(&NamespaceIdent::from_strs(["ns1"]).unwrap(), table_creation)
             .await;
 
-        assert!(table_result.is_err());
-        assert!(
-            table_result
-                .err()
-                .unwrap()
-                .message()
-                .contains("already exists")
-        );
+        let error = table_result.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TableAlreadyExists);
+        assert!(!error.retryable());
+        assert!(error.message().contains("already exists"));
 
         config_mock.assert_async().await;
         create_table_mock.assert_async().await;
@@ -2384,13 +2380,14 @@ mod tests {
 
         let config_mock = create_config_mock(&mut server).await;
 
+        // Transaction refresh must load the same table identity as its starting metadata.
         let load_table_mock = server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
             .with_status(200)
             .with_body_from_file(format!(
                 "{}/testdata/{}",
                 env!("CARGO_MANIFEST_DIR"),
-                "load_table_response.json"
+                "create_table_response.json"
             ))
             .create_async()
             .await;
@@ -2518,13 +2515,14 @@ mod tests {
 
         let config_mock = create_config_mock(&mut server).await;
 
+        // Transaction refresh must load the same table identity as its starting metadata.
         let load_table_mock = server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
             .with_status(200)
             .with_body_from_file(format!(
                 "{}/testdata/{}",
                 env!("CARGO_MANIFEST_DIR"),
-                "load_table_response.json"
+                "create_table_response.json"
             ))
             .create_async()
             .await;

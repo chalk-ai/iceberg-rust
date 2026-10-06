@@ -1073,6 +1073,48 @@ fn test_datum_date_convert_to_int() {
 }
 
 #[test]
+fn test_datum_date_convert_to_timestamp() {
+    for days in [-1, 1] {
+        let result = Datum::date(days)
+            .to(&Primitive(PrimitiveType::Timestamp))
+            .unwrap();
+        let expected = Datum::timestamp_micros(i64::from(days) * 86_400 * 1_000_000);
+        assert_eq!(result, expected);
+    }
+    for days in [i32::MIN, i32::MAX] {
+        let error = Datum::date(days)
+            .to(&Primitive(PrimitiveType::Timestamp))
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    }
+}
+
+#[test]
+fn test_datum_date_convert_to_timestamptz() {
+    for days in [-1, 1] {
+        let result = Datum::date(days)
+            .to(&Primitive(PrimitiveType::Timestamptz))
+            .unwrap();
+        let expected = Datum::timestamptz_micros(i64::from(days) * 86_400 * 1_000_000);
+        assert_eq!(result, expected);
+    }
+    for days in [i32::MIN, i32::MAX] {
+        let error = Datum::date(days)
+            .to(&Primitive(PrimitiveType::Timestamptz))
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    }
+}
+
+#[test]
+fn test_datum_date_convert_to_timestamp_epoch() {
+    let datum = Datum::date(0);
+    let result = datum.to(&Primitive(PrimitiveType::Timestamp)).unwrap();
+    let expected = Datum::timestamp_micros(0);
+    assert_eq!(result, expected);
+}
+
+#[test]
 fn test_datum_int_convert_to_date() {
     let datum_int = Datum::int(12345);
 

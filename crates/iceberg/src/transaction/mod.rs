@@ -71,7 +71,7 @@ use std::time::Duration;
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
 
 use crate::error::Result;
-use crate::spec::{TableProperties, UnboundPartitionSpec};
+use crate::spec::{MAIN_BRANCH, TableProperties, UnboundPartitionSpec};
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
@@ -85,11 +85,26 @@ use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
 use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
 
+/// Whether transaction actions may be reapplied to a newer table state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RebasePolicy {
+    /// Refresh the table and retry eligible conflicts.
+    #[default]
+    Allow,
+    /// Preserve the original read state and fail conflicts without retrying.
+    ///
+    /// Catalog requirements protect the UUID, main snapshot, schema, partition spec,
+    /// sort order, and assigned IDs at publication. They do not assert an exact
+    /// metadata location or arbitrary properties changed after a refresh.
+    Forbid,
+}
+
 /// Table transaction.
 #[derive(Clone)]
 pub struct Transaction {
     table: Table,
     actions: Vec<BoxedTransactionAction>,
+    rebase_policy: RebasePolicy,
 }
 
 impl Transaction {
@@ -98,7 +113,14 @@ impl Transaction {
         Self {
             table: table.clone(),
             actions: vec![],
+            rebase_policy: RebasePolicy::Allow,
         }
+    }
+
+    /// Sets whether actions can be reapplied to a newer table state.
+    pub fn with_rebase_policy(mut self, policy: RebasePolicy) -> Self {
+        self.rebase_policy = policy;
+        self
     }
 
     fn update_table_metadata(table: Table, updates: &[TableUpdate]) -> Result<Table> {
@@ -183,7 +205,7 @@ impl Transaction {
 
     /// Commit transaction once, with no internal retry.
     pub async fn commit_once(self, catalog: &dyn Catalog) -> Result<Table> {
-        if self.actions.is_empty() {
+        if self.actions.is_empty() && self.rebase_policy == RebasePolicy::Allow {
             return Ok(self.table);
         }
         let mut tx = self;
@@ -192,7 +214,7 @@ impl Transaction {
 
     /// Commit transaction.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
-        if self.actions.is_empty() {
+        if self.actions.is_empty() && self.rebase_policy == RebasePolicy::Allow {
             // nothing to commit
             return Ok(self.table);
         }
@@ -251,6 +273,7 @@ impl Transaction {
 
     fn build_backoff(props: TableProperties) -> Result<ExponentialBackoff> {
         Ok(ExponentialBuilder::new()
+            .with_jitter()
             .with_min_delay(Duration::from_millis(props.commit_min_retry_wait_ms))
             .with_max_delay(Duration::from_millis(props.commit_max_retry_wait_ms))
             .with_total_delay(Some(Duration::from_millis(
@@ -264,7 +287,37 @@ impl Transaction {
     async fn build_table_commit_from_current_base(&self) -> Result<TableCommit> {
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
-        let mut existing_requirements: Vec<TableRequirement> = vec![];
+        // Actions may change schema or partition state locally. The catalog must
+        // validate against the original read base, before any action is applied.
+        let mut existing_requirements = if self.rebase_policy == RebasePolicy::Forbid {
+            let metadata = self.table.metadata();
+            vec![
+                TableRequirement::UuidMatch {
+                    uuid: metadata.uuid(),
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: MAIN_BRANCH.to_string(),
+                    snapshot_id: metadata.current_snapshot_id(),
+                },
+                TableRequirement::CurrentSchemaIdMatch {
+                    current_schema_id: metadata.current_schema_id(),
+                },
+                TableRequirement::LastAssignedFieldIdMatch {
+                    last_assigned_field_id: metadata.last_column_id(),
+                },
+                TableRequirement::DefaultSpecIdMatch {
+                    default_spec_id: metadata.default_partition_spec_id(),
+                },
+                TableRequirement::LastAssignedPartitionIdMatch {
+                    last_assigned_partition_id: metadata.last_partition_id(),
+                },
+                TableRequirement::DefaultSortOrderIdMatch {
+                    default_sort_order_id: metadata.default_sort_order_id(),
+                },
+            ]
+        } else {
+            vec![]
+        };
 
         for action in &self.actions {
             let action_commit = Arc::clone(action).commit(&current_table).await?;
@@ -287,20 +340,55 @@ impl Transaction {
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
         let refreshed = catalog.load_table(self.table.identifier()).await?;
 
+        // Replaying actions against refreshed metadata is safe only for the same
+        // table identity; a reused catalog name must not inherit pending writes.
+        if refreshed.metadata().uuid() != self.table.metadata().uuid() {
+            return Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                format!(
+                    "Iceberg table UUID changed while committing {}",
+                    self.table.identifier()
+                ),
+            )
+            .with_retryable(false)
+            .with_context("expected_uuid", self.table.metadata().uuid().to_string())
+            .with_context("found_uuid", refreshed.metadata().uuid().to_string()));
+        }
+
         if self.table.metadata() != refreshed.metadata()
             || self.table.metadata_location() != refreshed.metadata_location()
         {
+            if self.rebase_policy == RebasePolicy::Forbid {
+                return Err(Error::new(
+                    ErrorKind::CatalogCommitConflicts,
+                    format!(
+                        "Iceberg table metadata changed while committing {}; recompute the transaction from the current table",
+                        self.table.identifier()
+                    ),
+                )
+                .with_retryable(false));
+            }
             // Current base is stale, so re-apply the transaction actions against the refreshed
             // table before constructing the commit.
             self.table = refreshed.clone();
         }
 
         let table_commit = self.build_table_commit_from_current_base().await?;
-        catalog.update_table(table_commit).await
+        catalog.update_table(table_commit).await.map_err(|err| {
+            if self.rebase_policy == RebasePolicy::Forbid
+                && err.kind() == ErrorKind::CatalogCommitConflicts
+            {
+                err.with_retryable(false)
+            } else {
+                err
+            }
+        })
     }
 
     /// Build a [`TableCommit`] from the transaction's current base table without refreshing it
     /// from the catalog first.
+    /// With [`RebasePolicy::Forbid`], the commit carries original-base requirements;
+    /// the caller owns publication, conflict handling and any full-metadata comparison.
     pub async fn into_table_commit_no_refresh(self) -> Result<TableCommit> {
         self.build_table_commit_from_current_base().await
     }
@@ -316,10 +404,14 @@ mod tests {
 
     use crate::catalog::MockCatalog;
     use crate::io::FileIOBuilder;
-    use crate::spec::TableMetadata;
+    use crate::spec::{
+        MAIN_BRANCH, NestedField, Operation, PrimitiveType, Schema, Snapshot, SnapshotReference,
+        SnapshotRetention, SortOrder, Summary, TableMetadata, Transform, Type,
+        UnboundPartitionSpec,
+    };
     use crate::table::Table;
-    use crate::transaction::{ApplyTransactionAction, Transaction};
-    use crate::{Catalog, Error, ErrorKind, TableCreation, TableIdent};
+    use crate::transaction::{ApplyTransactionAction, RebasePolicy, Transaction};
+    use crate::{Catalog, Error, ErrorKind, Result, TableCreation, TableIdent, TableUpdate};
 
     pub fn make_v1_table() -> Table {
         let file = File::open(format!(
@@ -512,6 +604,479 @@ mod tests {
             });
 
         mock_catalog
+    }
+
+    #[tokio::test]
+    async fn test_commit_rejects_table_replacement_before_and_after_conflict() {
+        for conflict_first in [false, true] {
+            let original = setup_test_table("3");
+            let replacement = original.clone().with_metadata(Arc::new(
+                original
+                    .metadata()
+                    .clone()
+                    .into_builder(None)
+                    .assign_uuid(uuid::Uuid::new_v4())
+                    .build()
+                    .unwrap()
+                    .metadata,
+            ));
+            let mut catalog = MockCatalog::new();
+            let loads = AtomicU32::new(0);
+            let original_copy = original.clone();
+            catalog
+                .expect_load_table()
+                .times(if conflict_first { 2 } else { 1 })
+                .returning_st(move |_| {
+                    let table = if conflict_first && loads.fetch_add(1, Ordering::SeqCst) == 0 {
+                        original_copy.clone()
+                    } else {
+                        replacement.clone()
+                    };
+                    Box::pin(async move { Ok(table) })
+                });
+            catalog
+                .expect_update_table()
+                .times(usize::from(conflict_first))
+                .returning_st(|_| {
+                    Box::pin(async {
+                        Err(
+                            Error::new(ErrorKind::CatalogCommitConflicts, "Commit conflict")
+                                .with_retryable(true),
+                        )
+                    })
+                });
+            let err = create_test_transaction(&original)
+                .commit(&catalog)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+            assert!(!err.retryable());
+            assert!(err.to_string().contains("UUID changed"));
+        }
+    }
+
+    fn concurrent_changes(table: &Table) -> Result<Vec<(&'static str, Table)>> {
+        let metadata = table.metadata();
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(123456789)
+            .with_parent_snapshot_id(metadata.current_snapshot_id())
+            .with_sequence_number(metadata.last_sequence_number() + 1)
+            .with_timestamp_ms(metadata.last_updated_ms() + 1)
+            .with_manifest_list("s3://bucket/test/location/manifest-list.avro")
+            .with_schema_id(metadata.current_schema_id())
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+        let renamed_schema = Schema::builder()
+            .with_fields(
+                metadata
+                    .current_schema()
+                    .as_struct()
+                    .fields()
+                    .iter()
+                    .map(|field| {
+                        let mut field = field.as_ref().clone();
+                        field.name = format!("{}_renamed", field.name);
+                        Arc::new(field)
+                    }),
+            )
+            .build()?;
+        let extended_schema = metadata
+            .current_schema()
+            .as_ref()
+            .clone()
+            .into_builder()
+            .with_fields([Arc::new(NestedField::optional(
+                metadata.last_column_id() + 1,
+                "new_column",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()?;
+        let new_spec = UnboundPartitionSpec::builder()
+            .add_partition_field(2, "y", Transform::Identity)?
+            .build();
+        let changes = [
+            ("uuid", vec![TableUpdate::AssignUuid {
+                uuid: uuid::Uuid::new_v4(),
+            }]),
+            ("snapshot", vec![
+                TableUpdate::AddSnapshot { snapshot },
+                TableUpdate::SetSnapshotRef {
+                    ref_name: MAIN_BRANCH.to_string(),
+                    reference: SnapshotReference::new(
+                        123456789,
+                        SnapshotRetention::branch(None, None, None),
+                    ),
+                },
+            ]),
+            ("schema", vec![
+                TableUpdate::AddSchema {
+                    schema: renamed_schema,
+                },
+                TableUpdate::SetCurrentSchema { schema_id: -1 },
+            ]),
+            ("assigned field ID", vec![TableUpdate::AddSchema {
+                schema: extended_schema,
+            }]),
+            ("partition spec", vec![
+                TableUpdate::AddSpec {
+                    spec: UnboundPartitionSpec::builder().build(),
+                },
+                TableUpdate::SetDefaultSpec { spec_id: -1 },
+            ]),
+            ("assigned partition ID", vec![TableUpdate::AddSpec {
+                spec: new_spec,
+            }]),
+            ("sort order", vec![
+                TableUpdate::AddSortOrder {
+                    sort_order: SortOrder::unsorted_order(),
+                },
+                TableUpdate::SetDefaultSortOrder { sort_order_id: -1 },
+            ]),
+        ];
+        changes
+            .into_iter()
+            .map(|(name, updates)| {
+                Ok((
+                    name,
+                    Transaction::update_table_metadata(table.clone(), &updates)?,
+                ))
+            })
+            .collect()
+    }
+
+    fn catalog_with_publication_state(loaded: Table, at_publication: Table) -> MockCatalog {
+        let mut catalog = MockCatalog::new();
+        catalog.expect_load_table().times(1).returning_st(move |_| {
+            let loaded = loaded.clone();
+            Box::pin(async move { Ok(loaded) })
+        });
+        catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(move |commit| {
+                let at_publication = at_publication.clone();
+                Box::pin(async move { commit.apply(at_publication) })
+            });
+        catalog
+    }
+
+    #[tokio::test]
+    async fn test_forbid_rebase_rejects_changes_before_refresh_and_publication() -> Result<()> {
+        for original in [make_v2_table(), make_v2_minimal_table()] {
+            for (change, changed) in concurrent_changes(&original)? {
+                for at_publication in [false, true] {
+                    let mut catalog = if at_publication {
+                        // The initial load is unchanged; the catalog validates against
+                        // another writer's state when publication is attempted.
+                        catalog_with_publication_state(original.clone(), changed.clone())
+                    } else {
+                        let mut catalog = MockCatalog::new();
+                        let changed = changed.clone();
+                        catalog.expect_load_table().times(1).returning_st(move |_| {
+                            let changed = changed.clone();
+                            Box::pin(async move { Ok(changed) })
+                        });
+                        catalog.expect_update_table().times(0);
+                        catalog
+                    };
+                    // Empty MERGE output still needs validation of the absent snapshot.
+                    let tx = if original.metadata().current_snapshot_id().is_none() {
+                        Transaction::new(&original)
+                    } else {
+                        create_test_transaction(&original)
+                    }
+                    .with_rebase_policy(RebasePolicy::Forbid);
+                    let err = tx.commit(&catalog).await.unwrap_err();
+                    assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts, "{change}");
+                    assert!(
+                        !err.retryable(),
+                        "{change}, at publication: {at_publication}"
+                    );
+                    catalog.checkpoint();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_forbid_rebase_rejects_location_and_property_changes_at_refresh() -> Result<()> {
+        let original = make_v2_table();
+        let property_change =
+            Transaction::update_table_metadata(original.clone(), &[TableUpdate::SetProperties {
+                updates: HashMap::from([("concurrent".to_string(), "value".to_string())]),
+            }])?;
+        for changed in [
+            original
+                .clone()
+                .with_metadata_location("s3://bucket/other.metadata.json".to_string()),
+            property_change,
+        ] {
+            let mut catalog = MockCatalog::new();
+            catalog.expect_load_table().times(1).returning_st(move |_| {
+                let changed = changed.clone();
+                Box::pin(async move { Ok(changed) })
+            });
+            catalog.expect_update_table().times(0);
+            let err = create_test_transaction(&original)
+                .with_rebase_policy(RebasePolicy::Forbid)
+                .commit_once(&catalog)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+            assert!(!err.retryable());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_forbid_rebase_validates_original_state_before_actions() -> Result<()> {
+        let original = make_v2_minimal_table().with_metadata_location(format!(
+            "s3://bucket/test/location/metadata/00000-{}.metadata.json",
+            uuid::Uuid::new_v4(),
+        ));
+        let tx = create_test_transaction(&original).with_rebase_policy(RebasePolicy::Forbid);
+        let tx = tx
+            .replace_partition_spec(UnboundPartitionSpec::builder().build())
+            .apply(tx)?;
+        let catalog = catalog_with_publication_state(original.clone(), original.clone());
+        let committed = tx.commit(&catalog).await?;
+        assert_ne!(
+            committed.metadata().default_partition_spec_id(),
+            original.metadata().default_partition_spec_id()
+        );
+        assert_eq!(
+            committed
+                .metadata()
+                .properties()
+                .get("test.key")
+                .map(String::as_str),
+            Some("test.value")
+        );
+
+        let catalog = catalog_with_publication_state(original.clone(), original.clone());
+        let validated = Transaction::new(&original)
+            .with_rebase_policy(RebasePolicy::Forbid)
+            .commit_once(&catalog)
+            .await?;
+        // A catalog may publish a new metadata file for a validation-only commit.
+        assert_eq!(validated.metadata().uuid(), original.metadata().uuid());
+        assert_eq!(validated.metadata().current_snapshot_id(), None);
+        assert_eq!(
+            validated.metadata().current_schema(),
+            original.metadata().current_schema()
+        );
+        assert_eq!(
+            validated.metadata().default_partition_spec(),
+            original.metadata().default_partition_spec()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_forbid_rebase_does_not_retry_catalog_conflicts() {
+        let original = setup_test_table("3");
+        let mut catalog = MockCatalog::new();
+        let loaded = original.clone();
+        catalog.expect_load_table().times(1).returning_st(move |_| {
+            let loaded = loaded.clone();
+            Box::pin(async move { Ok(loaded) })
+        });
+        catalog.expect_update_table().times(1).returning_st(|_| {
+            Box::pin(async {
+                Err(
+                    Error::new(ErrorKind::CatalogCommitConflicts, "Concurrent commit")
+                        .with_retryable(true),
+                )
+            })
+        });
+        let err = create_test_transaction(&original)
+            .with_rebase_policy(RebasePolicy::Forbid)
+            .commit(&catalog)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(!err.retryable());
+    }
+
+    #[tokio::test]
+    async fn test_forbid_rebase_retries_transient_errors_only_while_read_base_matches() -> Result<()>
+    {
+        for metadata_changed in [false, true] {
+            let original = setup_test_table("3").with_metadata_location(format!(
+                "s3://bucket/test/location/metadata/00000-{}.metadata.json",
+                uuid::Uuid::new_v4(),
+            ));
+            let refreshed = if metadata_changed {
+                Transaction::update_table_metadata(original.clone(), &[
+                    TableUpdate::SetProperties {
+                        updates: HashMap::from([("concurrent".to_string(), "value".to_string())]),
+                    },
+                ])?
+            } else {
+                original.clone()
+            };
+            assert_eq!(
+                refreshed.metadata().current_snapshot_id(),
+                original.metadata().current_snapshot_id()
+            );
+            let mut catalog = MockCatalog::new();
+            let loads = AtomicU32::new(0);
+            let first_load = original.clone();
+            catalog.expect_load_table().times(2).returning_st(move |_| {
+                let table = if loads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    first_load.clone()
+                } else {
+                    refreshed.clone()
+                };
+                Box::pin(async move { Ok(table) })
+            });
+            let attempts = AtomicU32::new(0);
+            let at_publication = original.clone();
+            catalog
+                .expect_update_table()
+                .times(if metadata_changed { 1 } else { 2 })
+                .returning_st(move |commit| {
+                    let first_attempt = attempts.fetch_add(1, Ordering::SeqCst) == 0;
+                    let table = at_publication.clone();
+                    Box::pin(async move {
+                        if first_attempt {
+                            // The failure occurs before publication; retrying is safe
+                            // only if the next refresh still matches the original read.
+                            Err(
+                                Error::new(ErrorKind::Unexpected, "Transient transport failure")
+                                    .with_retryable(true),
+                            )
+                        } else {
+                            commit.apply(table)
+                        }
+                    })
+                });
+            let result = create_test_transaction(&original)
+                .with_rebase_policy(RebasePolicy::Forbid)
+                .commit(&catalog)
+                .await;
+            if metadata_changed {
+                let err = result.unwrap_err();
+                assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+                assert!(!err.retryable());
+                assert!(
+                    err.context()
+                        .iter()
+                        .any(|(key, value)| *key == "retry_attempts" && value == "1")
+                );
+            } else {
+                let committed = result?;
+                assert_eq!(committed.retry_attempts(), Some(1));
+                assert_eq!(
+                    committed
+                        .metadata()
+                        .properties()
+                        .get("test.key")
+                        .map(String::as_str),
+                    Some("test.value")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_allow_rebase_preserves_concurrent_metadata_changes() -> Result<()> {
+        let original = make_v2_table();
+        let changed = Transaction::update_table_metadata(original.clone(), &[
+            TableUpdate::SetProperties {
+                updates: HashMap::from([("concurrent".to_string(), "value".to_string())]),
+            },
+            TableUpdate::AddSpec {
+                spec: UnboundPartitionSpec::builder().build(),
+            },
+            TableUpdate::SetDefaultSpec { spec_id: -1 },
+        ])?
+        .with_metadata_location(format!(
+            "s3://bucket/test/location/metadata/00001-{}.metadata.json",
+            uuid::Uuid::new_v4(),
+        ));
+        let catalog = catalog_with_publication_state(changed.clone(), changed);
+        let tx = create_test_transaction(&original);
+        let tx = tx
+            .replace_partition_spec(
+                original
+                    .metadata()
+                    .default_partition_spec()
+                    .as_ref()
+                    .clone()
+                    .into_unbound(),
+            )
+            .apply(tx)?;
+        let committed = tx.commit(&catalog).await?;
+        assert_eq!(
+            committed
+                .metadata()
+                .properties()
+                .get("concurrent")
+                .map(String::as_str),
+            Some("value")
+        );
+        assert_eq!(
+            committed
+                .metadata()
+                .properties()
+                .get("test.key")
+                .map(String::as_str),
+            Some("test.value")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_forbid_rebase_no_refresh_commit_preserves_original_requirements() -> Result<()> {
+        for original in [make_v2_table(), make_v2_minimal_table()] {
+            let original = original.with_metadata_location(format!(
+                "s3://bucket/test/location/metadata/00000-{}.metadata.json",
+                uuid::Uuid::new_v4(),
+            ));
+            for with_action in [false, true] {
+                let tx = if with_action {
+                    create_test_transaction(&original)
+                } else {
+                    Transaction::new(&original)
+                }
+                .with_rebase_policy(RebasePolicy::Forbid);
+                // Commit construction has no catalog to refresh. Its requirements must
+                // still reject a changed base when the caller submits it for publication.
+                for (change, changed) in concurrent_changes(&original)? {
+                    let err = tx
+                        .clone()
+                        .into_table_commit_no_refresh()
+                        .await?
+                        .apply(changed)
+                        .unwrap_err();
+                    assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts, "{change}");
+                }
+                let committed = tx
+                    .into_table_commit_no_refresh()
+                    .await?
+                    .apply(original.clone())?;
+                assert_eq!(committed.metadata().uuid(), original.metadata().uuid());
+                assert_eq!(
+                    committed.metadata().current_snapshot_id(),
+                    original.metadata().current_snapshot_id()
+                );
+                assert_eq!(
+                    committed
+                        .metadata()
+                        .properties()
+                        .get("test.key")
+                        .map(String::as_str),
+                    with_action.then_some("test.value")
+                );
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]

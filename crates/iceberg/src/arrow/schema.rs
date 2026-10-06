@@ -480,6 +480,8 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
             DataType::Utf8View | DataType::Utf8 | DataType::LargeUtf8 => {
                 Ok(Type::Primitive(PrimitiveType::String))
             }
+            // This schema mapping does not rescale duration values.
+            DataType::Duration(_) => Ok(Type::Primitive(PrimitiveType::Long)),
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!("Unsupported Arrow data type: {p}"),
@@ -1110,7 +1112,7 @@ pub fn datum_to_arrow_type_with_ree(datum: &Datum) -> DataType {
         PrimitiveType::Float => make_ree(DataType::Float32),
         PrimitiveType::Double => make_ree(DataType::Float64),
         PrimitiveType::Date => make_ree(DataType::Date32),
-        PrimitiveType::Time => make_ree(DataType::Int64),
+        PrimitiveType::Time => make_ree(DataType::Time64(TimeUnit::Microsecond)),
         PrimitiveType::Timestamp => make_ree(DataType::Int64),
         PrimitiveType::Timestamptz => make_ree(DataType::Int64),
         PrimitiveType::TimestampNs => make_ree(DataType::Int64),
@@ -1135,6 +1137,21 @@ mod tests {
 
     use super::*;
     use crate::spec::{Literal, Schema};
+
+    #[test]
+    fn test_duration_schema_maps_all_units_to_long() {
+        for unit in [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ] {
+            assert_eq!(
+                arrow_type_to_type(&DataType::Duration(unit)).unwrap(),
+                Type::Primitive(PrimitiveType::Long)
+            );
+        }
+    }
 
     /// Create a simple field with metadata.
     fn simple_field(name: &str, ty: DataType, nullable: bool, value: &str) -> Field {

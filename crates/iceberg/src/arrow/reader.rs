@@ -27,7 +27,8 @@ use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatc
 use arrow_cast::cast::cast;
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{
-    ArrowError, DataType, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+    ArrowError, DataType, Field as ArrowField, FieldRef, Fields as ArrowFields,
+    Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use arrow_string::like::starts_with;
 use bytes::Bytes;
@@ -56,7 +57,7 @@ use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, is_metadata_field};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::{Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
+use crate::spec::{Datum, MappedField, NameMapping, NestedField, PrimitiveType, Schema, Type};
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind};
 
@@ -195,45 +196,18 @@ impl ArrowReader {
         )
         .await?;
 
-        // Check if Parquet file has embedded field IDs
-        // Corresponds to Java's ParquetSchemaUtil.hasIds()
-        // Reference: parquet/src/main/java/org/apache/iceberg/parquet/ParquetSchemaUtil.java:118
-        let missing_field_ids = initial_stream_builder
-            .schema()
-            .fields()
-            .iter()
-            .next()
-            .is_some_and(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none());
-
-        // Three-branch schema resolution strategy matching Java's ReadConf constructor
-        //
-        // Per Iceberg spec Column Projection rules:
-        // "Columns in Iceberg data files are selected by field id. The table schema's column
-        //  names and order may change after a data file is written, and projection must be done
-        //  using field ids."
-        // https://iceberg.apache.org/spec/#column-projection
-        //
-        // When Parquet files lack field IDs (e.g., Hive/Spark migrations via add_files),
-        // we must assign field IDs BEFORE reading data to enable correct projection.
-        //
-        // Java's ReadConf determines field ID strategy:
-        // - Branch 1: hasIds(fileSchema) → trust embedded field IDs, use pruneColumns()
-        // - Branch 2: nameMapping present → applyNameMapping(), then pruneColumns()
-        // - Branch 3: fallback → addFallbackIds(), then pruneColumnsFallback()
+        // Embedded IDs remain authoritative. Name-mapped files use those recovered IDs;
+        // only files without either source of identity may use positional fallback.
+        let missing_field_ids = arrow_schema_lacks_field_ids(initial_stream_builder.schema());
+        let use_fallback = missing_field_ids && task.name_mapping.is_none();
+        let name_mapping_applied = missing_field_ids && task.name_mapping.is_some();
         let mut record_batch_stream_builder = if missing_field_ids {
-            // Parquet file lacks field IDs - must assign them before reading
             let arrow_schema = if let Some(name_mapping) = &task.name_mapping {
-                // Branch 2: Apply name mapping to assign correct Iceberg field IDs
-                // Per spec rule #2: "Use schema.name-mapping.default metadata to map field id
-                // to columns without field id"
-                // Corresponds to Java's ParquetSchemaUtil.applyNameMapping()
                 apply_name_mapping_to_arrow_schema(
                     Arc::clone(initial_stream_builder.schema()),
                     name_mapping,
-                )?
+                )
             } else {
-                // Branch 3: No name mapping - use position-based fallback IDs
-                // Corresponds to Java's ParquetSchemaUtil.addFallbackIds()
                 add_fallback_field_ids_to_arrow_schema(initial_stream_builder.schema())
             };
 
@@ -247,7 +221,6 @@ impl ArrowReader {
             )
             .await?
         } else {
-            // Branch 1: File has embedded field IDs - trust them
             initial_stream_builder
         };
 
@@ -259,16 +232,12 @@ impl ArrowReader {
             .copied()
             .collect();
 
-        // Create projection mask based on field IDs
-        // - If file has embedded IDs: field-ID-based projection (missing_field_ids=false)
-        // - If name mapping applied: field-ID-based projection (missing_field_ids=true but IDs now match)
-        // - If fallback IDs: position-based projection (missing_field_ids=true)
         let projection_mask = Self::get_arrow_projection_mask(
             &project_field_ids_without_metadata,
             &task.schema,
             record_batch_stream_builder.parquet_schema(),
             record_batch_stream_builder.schema(),
-            missing_field_ids, // Whether to use position-based (true) or field-ID-based (false) projection
+            use_fallback,
         )?;
 
         record_batch_stream_builder =
@@ -348,6 +317,7 @@ impl ArrowReader {
         if let Some(predicate) = final_predicate {
             let (iceberg_field_ids, field_id_map) = Self::build_field_id_set_and_map(
                 record_batch_stream_builder.parquet_schema(),
+                name_mapping_applied.then_some(record_batch_stream_builder.schema().as_ref()),
                 &predicate,
             )?;
 
@@ -586,6 +556,7 @@ impl ArrowReader {
 
     fn build_field_id_set_and_map(
         parquet_schema: &SchemaDescriptor,
+        name_mapped_schema: Option<&ArrowSchema>,
         predicate: &BoundPredicate,
     ) -> Result<(HashSet<i32>, HashMap<i32, usize>)> {
         // Collects all Iceberg field IDs referenced in the filter predicate
@@ -596,10 +567,24 @@ impl ArrowReader {
 
         let iceberg_field_ids = collector.field_ids();
 
-        // Without embedded field IDs, we fall back to position-based mapping for compatibility
-        let field_id_map = match build_field_id_map(parquet_schema)? {
-            Some(map) => map,
-            None => build_fallback_field_id_map(parquet_schema),
+        // Filters and equality deletes must resolve the same IDs as the output projection.
+        // The original Parquet schema does not contain IDs recovered through name mapping.
+        let field_id_map = if let Some(schema) = name_mapped_schema {
+            let mut column_map = HashMap::new();
+            let _ = schema.fields().filter_leaves(|idx, field| {
+                if let Some(id) = field.metadata().get(PARQUET_FIELD_ID_META_KEY)
+                    && let Ok(id) = id.parse::<i32>()
+                {
+                    column_map.insert(id, idx);
+                }
+                false
+            });
+            column_map
+        } else {
+            match build_field_id_map(parquet_schema)? {
+                Some(map) => map,
+                None => build_fallback_field_id_map(parquet_schema),
+            }
         };
 
         Ok((iceberg_field_ids, field_id_map))
@@ -642,6 +627,16 @@ impl ArrowReader {
                 (Some(lhs), Some(rhs)) if lhs == rhs => true,
                 (Some(PrimitiveType::Int), Some(PrimitiveType::Long)) => true,
                 (Some(PrimitiveType::Float), Some(PrimitiveType::Double)) => true,
+                // Iceberg time is stored as an int64 microsecond value. Some writers surface the
+                // Parquet leaf to Arrow as a plain Int64 rather than Time64(us); keep the column
+                // projected so RecordBatchTransformer can cast it to the table schema.
+                (Some(PrimitiveType::Long), Some(PrimitiveType::Time)) => true,
+                // Some Parquet/Arrow paths differ only in timestamp timezone annotation. Keep the
+                // physical column projected and let RecordBatchTransformer cast to the table schema.
+                (Some(PrimitiveType::Timestamp), Some(PrimitiveType::Timestamptz)) => true,
+                (Some(PrimitiveType::Timestamptz), Some(PrimitiveType::Timestamp)) => true,
+                (Some(PrimitiveType::TimestampNs), Some(PrimitiveType::TimestamptzNs)) => true,
+                (Some(PrimitiveType::TimestamptzNs), Some(PrimitiveType::TimestampNs)) => true,
                 (
                     Some(PrimitiveType::Decimal {
                         precision: file_precision,
@@ -980,74 +975,100 @@ fn build_fallback_field_id_map(parquet_schema: &SchemaDescriptor) -> HashMap<i32
     column_map
 }
 
-/// Apply name mapping to Arrow schema for Parquet files lacking field IDs.
-///
-/// Assigns Iceberg field IDs based on column names using the name mapping,
-/// enabling correct projection on migrated files (e.g., from Hive/Spark via add_files).
-///
-/// Per Iceberg spec Column Projection rule #2:
-/// "Use schema.name-mapping.default metadata to map field id to columns without field id"
-/// https://iceberg.apache.org/spec/#column-projection
-///
-/// Corresponds to Java's ParquetSchemaUtil.applyNameMapping() and ApplyNameMapping visitor.
-/// The key difference is Java operates on Parquet MessageType, while we operate on Arrow Schema.
-///
-/// # Arguments
-/// * `arrow_schema` - Arrow schema from Parquet file (without field IDs)
-/// * `name_mapping` - Name mapping from table metadata (TableProperties.DEFAULT_NAME_MAPPING)
-///
-/// # Returns
-/// Arrow schema with field IDs assigned based on name mapping
+/// A file with embedded field IDs does not use name mapping, even if some fields lack IDs.
+fn arrow_schema_lacks_field_ids(schema: &ArrowSchema) -> bool {
+    fn field_has_id(field: &ArrowField) -> bool {
+        if field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY) {
+            return true;
+        }
+        match field.data_type() {
+            DataType::Struct(fields) => fields.iter().any(|field| field_has_id(field)),
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::Map(field, _) => field_has_id(field),
+            _ => false,
+        }
+    }
+    !schema.fields().iter().any(|field| field_has_id(field))
+}
+
+/// Annotate ID-less fields recursively; unmapped fields stay anonymous rather than acquiring
+/// positional IDs that could bind them to unrelated table columns.
 fn apply_name_mapping_to_arrow_schema(
-    arrow_schema: ArrowSchemaRef,
+    schema: ArrowSchemaRef,
     name_mapping: &NameMapping,
-) -> Result<Arc<ArrowSchema>> {
-    debug_assert!(
-        arrow_schema
-            .fields()
-            .iter()
-            .next()
-            .is_none_or(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none()),
-        "Schema already has field IDs - name mapping should not be applied"
-    );
-
-    use arrow_schema::Field;
-
-    let fields_with_mapped_ids: Vec<_> = arrow_schema
+) -> Arc<ArrowSchema> {
+    let mapped: ArrowFields = schema
         .fields()
         .iter()
         .map(|field| {
-            // Look up this column name in name mapping to get the Iceberg field ID.
-            // Corresponds to Java's ApplyNameMapping visitor which calls
-            // nameMapping.find(currentPath()) and returns field.withId() if found.
-            //
-            // If the field isn't in the mapping, leave it WITHOUT assigning an ID
-            // (matching Java's behavior of returning the field unchanged).
-            // Later, during projection, fields without IDs are filtered out.
-            let mapped_field_opt = name_mapping
+            name_mapping
                 .fields()
                 .iter()
-                .find(|f| f.names().contains(&field.name().to_string()));
-
-            let mut metadata = field.metadata().clone();
-
-            if let Some(mapped_field) = mapped_field_opt
-                && let Some(field_id) = mapped_field.field_id()
-            {
-                // Field found in mapping with a field_id → assign it
-                metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
-            }
-            // If field_id is None, leave the field without an ID (will be filtered by projection)
-
-            Field::new(field.name(), field.data_type().clone(), field.is_nullable())
-                .with_metadata(metadata)
+                .find(|mapped| mapped.names().iter().any(|name| name == field.name()))
+                .map(|mapped| Arc::new(annotate_field_with_mapping(field, mapped)))
+                .unwrap_or_else(|| field.clone())
         })
         .collect();
+    Arc::new(ArrowSchema::new_with_metadata(
+        mapped,
+        schema.metadata().clone(),
+    ))
+}
 
-    Ok(Arc::new(ArrowSchema::new_with_metadata(
-        fields_with_mapped_ids,
-        arrow_schema.metadata().clone(),
-    )))
+fn annotate_field_with_mapping(field: &ArrowField, mapped: &MappedField) -> ArrowField {
+    let mut metadata = field.metadata().clone();
+    if let Some(id) = mapped.field_id() {
+        metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
+    }
+    field
+        .clone()
+        .with_data_type(annotate_data_type_with_mapping(
+            field.data_type(),
+            mapped.fields(),
+        ))
+        .with_metadata(metadata)
+}
+
+fn annotate_data_type_with_mapping(
+    data_type: &DataType,
+    children: &[Arc<MappedField>],
+) -> DataType {
+    let by_name = |field: &FieldRef| {
+        children
+            .iter()
+            .find(|mapped| mapped.names().iter().any(|name| name == field.name()))
+            .map(|mapped| Arc::new(annotate_field_with_mapping(field, mapped)))
+            .unwrap_or_else(|| field.clone())
+    };
+    // Arrow list elements may be named "item"; Iceberg's corresponding child is "element".
+    let list_element = |field: &FieldRef| {
+        children
+            .first()
+            .map(|mapped| Arc::new(annotate_field_with_mapping(field, mapped)))
+            .unwrap_or_else(|| field.clone())
+    };
+    match data_type {
+        DataType::Struct(fields) => DataType::Struct(fields.iter().map(by_name).collect()),
+        DataType::List(field) => DataType::List(list_element(field)),
+        DataType::LargeList(field) => DataType::LargeList(list_element(field)),
+        DataType::FixedSizeList(field, size) => DataType::FixedSizeList(list_element(field), *size),
+        DataType::Map(entries, sorted) => {
+            // Arrow wraps key/value in an entries struct; Iceberg maps key/value directly.
+            let entries = match entries.data_type() {
+                DataType::Struct(fields) => Arc::new(
+                    entries
+                        .as_ref()
+                        .clone()
+                        .with_data_type(DataType::Struct(fields.iter().map(by_name).collect())),
+                ),
+                _ => entries.clone(),
+            };
+            DataType::Map(entries, *sorted)
+        }
+        other => other.clone(),
+    }
 }
 
 /// Add position-based fallback field IDs to Arrow schema for Parquet files lacking them.
@@ -1880,10 +1901,11 @@ mod tests {
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 "1".to_string(),
             )])),
-            // Type not supported
-            Field::new("c2", DataType::Duration(TimeUnit::Microsecond), true).with_metadata(
-                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
-            ),
+            // Iceberg has no half-precision floating-point type.
+            Field::new("c2", DataType::Float16, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
             // Precision is beyond the supported range
             Field::new("c3", DataType::Decimal128(39, 3), true).with_metadata(HashMap::from([(
                 PARQUET_FIELD_ID_META_KEY.to_string(),
@@ -1914,7 +1936,7 @@ message schema {
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert_eq!(
             err.to_string(),
-            "DataInvalid => Unsupported Arrow data type: Duration(µs)".to_string()
+            "DataInvalid => Unsupported Arrow data type: Float16".to_string()
         );
 
         // Omitting field c2, we still get an error due to c3 being selected
@@ -1943,6 +1965,98 @@ message schema {
         )
         .expect("Some ProjectionMask");
         assert_eq!(mask, ProjectionMask::leaves(&parquet_schema, vec![0]));
+    }
+
+    #[test]
+    fn test_arrow_projection_mask_allows_long_file_column_for_time_field() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "t", Type::Primitive(PrimitiveType::Time)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("t", DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+
+        let message_type = "
+message schema {
+  required int32 id = 1;
+  optional int64 t = 2;
+}
+    ";
+        let parquet_type = parse_message_type(message_type).expect("should parse schema");
+        let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
+
+        let mask = ArrowReader::get_arrow_projection_mask(
+            &[1, 2],
+            &schema,
+            &parquet_schema,
+            &arrow_schema,
+            false,
+        )
+        .expect("Some ProjectionMask");
+        assert_eq!(mask, ProjectionMask::leaves(&parquet_schema, vec![0, 1]));
+    }
+
+    #[test]
+    fn test_arrow_projection_mask_allows_timestamp_timezone_annotation_mismatch() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "ts", Type::Primitive(PrimitiveType::Timestamp))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+
+        let message_type = "
+message schema {
+  required int32 id = 1;
+  optional int64 ts = 2;
+}
+    ";
+        let parquet_type = parse_message_type(message_type).expect("should parse schema");
+        let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
+
+        let mask = ArrowReader::get_arrow_projection_mask(
+            &[1, 2],
+            &schema,
+            &parquet_schema,
+            &arrow_schema,
+            false,
+        )
+        .expect("Some ProjectionMask");
+        assert_eq!(mask, ProjectionMask::leaves(&parquet_schema, vec![0, 1]));
     }
 
     #[tokio::test]
@@ -3206,6 +3320,264 @@ message schema {
             all_ids, expected_ids,
             "Should have ids 101-200 (all of row group 1)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_name_mapping_reordered_projection_filter_and_equality_delete() {
+        use arrow_array::Int32Array;
+
+        use crate::arrow::schema_to_arrow_schema;
+        use crate::spec::NameMapping;
+
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("mapped.parquet");
+        let delete_path = directory.path().join("delete.parquet");
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields([
+                    NestedField::optional(1, "key", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "value", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        // The file's names and order differ from the current table; only the mapping links them.
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("old_value", DataType::Int32, true),
+                Field::new("old_key", DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200, 300])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let delete_schema = schema_to_arrow_schema(&schema)
+            .unwrap()
+            .project(&[0])
+            .unwrap();
+        let delete_batch = RecordBatch::try_new(Arc::new(delete_schema), vec![Arc::new(
+            Int32Array::from(vec![2]),
+        )])
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(
+            File::create(&delete_path).unwrap(),
+            delete_batch.schema(),
+            None,
+        )
+        .unwrap();
+        writer.write(&delete_batch).unwrap();
+        writer.close().unwrap();
+        let mapping = Arc::new(
+            serde_json::from_str::<NameMapping>(
+                r#"[
+            {"field-id": 2, "names": ["old_value", "value"]},
+            {"field-id": 1, "names": ["old_key", "key"]}
+        ]"#,
+            )
+            .unwrap(),
+        );
+        let file_io = FileIO::from_path(directory.path().to_str().unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        for with_filter in [false, true] {
+            for with_delete in [false, true] {
+                for row_selection in [false, true] {
+                    let task = FileScanTask {
+                        start: 0,
+                        length: 0,
+                        record_count: Some(3),
+                        data_file_path: path.to_str().unwrap().to_owned(),
+                        data_file_format: DataFileFormat::Parquet,
+                        schema: schema.clone(),
+                        project_field_ids: vec![2],
+                        predicate: with_filter.then(|| {
+                            Reference::new("key")
+                                .greater_than(Datum::int(1))
+                                .bind(schema.clone(), true)
+                                .unwrap()
+                        }),
+                        deletes: if with_delete {
+                            vec![FileScanTaskDeleteFile {
+                                file_path: delete_path.to_str().unwrap().to_owned(),
+                                file_type: DataContentType::EqualityDeletes,
+                                equality_ids: Some(vec![1]),
+                                ..Default::default()
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        partition: None,
+                        partition_spec: None,
+                        name_mapping: Some(mapping.clone()),
+                        case_sensitive: true,
+                        data_file: None,
+                        data_sequence_number: Some(1),
+                    };
+                    let batches: Vec<_> = ArrowReaderBuilder::new(file_io.clone())
+                        .with_row_selection_enabled(row_selection)
+                        .build()
+                        .read(Box::pin(futures::stream::iter([Ok(task)])))
+                        .unwrap()
+                        .try_collect()
+                        .await
+                        .unwrap();
+                    let values: Vec<_> = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            assert_eq!(batch.num_columns(), 1);
+                            assert_eq!(batch.schema().field(0).name(), "value");
+                            batch
+                                .column(0)
+                                .as_primitive::<arrow_array::types::Int32Type>()
+                                .iter()
+                        })
+                        .collect();
+                    let expected: Vec<_> = [1, 2, 3]
+                        .into_iter()
+                        .filter(|key| (!with_filter || *key > 1) && (!with_delete || *key != 2))
+                        .map(|key| Some(key * 100))
+                        .collect();
+                    assert_eq!(
+                        values, expected,
+                        "filter={with_filter}, delete={with_delete}, row_selection={row_selection}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_name_mapping_recurses_into_struct_list_and_map() {
+        use arrow_array::builder::{Int32Builder, MapBuilder, MapFieldNames, StringBuilder};
+        use arrow_array::types::Int32Type;
+        use arrow_array::{Int32Array, ListArray, StructArray};
+
+        use crate::arrow::arrow_schema_to_schema;
+        use crate::spec::NameMapping;
+
+        let schema = ArrowSchema::new(vec![
+            Field::new(
+                "payload",
+                DataType::Struct(vec![Field::new("count", DataType::Int32, true)].into()),
+                true,
+            ),
+            Field::new(
+                "events",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            Field::new(
+                "attributes",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Field::new("key", DataType::Utf8, false),
+                                Field::new("value", DataType::Int32, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+        ]);
+        let mapping: NameMapping = serde_json::from_str(r#"[
+            {"field-id": 10, "names": ["payload"], "fields": [{"field-id": 11, "names": ["count"]}]},
+            {"field-id": 20, "names": ["events"], "fields": [{"field-id": 21, "names": ["element"]}]},
+            {"field-id": 30, "names": ["attributes"], "fields": [
+                {"field-id": 31, "names": ["key"]}, {"field-id": 32, "names": ["value"]}
+            ]}
+        ]"#).unwrap();
+        let mapped = super::apply_name_mapping_to_arrow_schema(Arc::new(schema.clone()), &mapping);
+        let mut leaf_ids = Vec::new();
+        let _ = mapped.fields().filter_leaves(|_, field| {
+            leaf_ids.push(field.metadata().get(PARQUET_FIELD_ID_META_KEY).cloned());
+            true
+        });
+        assert_eq!(leaf_ids, [11, 21, 31, 32].map(|id| Some(id.to_string())));
+        for (field, id) in mapped.fields().iter().zip([10, 20, 30]) {
+            assert_eq!(
+                field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+                Some(&id.to_string())
+            );
+        }
+        let mut attributes = MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "entries".to_owned(),
+                key: "key".to_owned(),
+                value: "value".to_owned(),
+            }),
+            StringBuilder::new(),
+            Int32Builder::new(),
+        );
+        attributes.keys().append_value("answer");
+        attributes.values().append_value(42);
+        attributes.append(true).unwrap();
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![
+            Arc::new(StructArray::from(vec![(
+                Arc::new(Field::new("count", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+            )])),
+            Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>([Some(
+                vec![Some(1), Some(2)],
+            )])),
+            Arc::new(attributes.finish()),
+        ])
+        .unwrap();
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("nested.parquet");
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let file_io = FileIO::from_path(directory.path().to_str().unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let iceberg_schema = Arc::new(arrow_schema_to_schema(&mapped).unwrap());
+        let mapping = Arc::new(mapping);
+        for (index, field_id) in [10, 20, 30].into_iter().enumerate() {
+            let task = FileScanTask {
+                start: 0,
+                length: 0,
+                record_count: Some(1),
+                data_file_path: path.to_str().unwrap().to_owned(),
+                data_file_format: DataFileFormat::Parquet,
+                schema: iceberg_schema.clone(),
+                project_field_ids: vec![field_id],
+                predicate: None,
+                deletes: vec![],
+                partition: None,
+                partition_spec: None,
+                name_mapping: Some(mapping.clone()),
+                case_sensitive: true,
+                data_file: None,
+                data_sequence_number: None,
+            };
+            let batches: Vec<_> = ArrowReaderBuilder::new(file_io.clone())
+                .build()
+                .read(Box::pin(futures::stream::iter([Ok(task)])))
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].num_columns(), 1);
+            let actual = batches[0].column(0);
+            let expected = arrow_cast::cast(batch.column(index), actual.data_type()).unwrap();
+            assert_eq!(actual, &expected, "nested field {field_id}");
+        }
     }
 
     /// Test reading Parquet files without field ID metadata (e.g., migrated tables).
