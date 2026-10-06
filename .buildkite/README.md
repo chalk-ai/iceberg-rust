@@ -37,3 +37,17 @@ The lane is a hard failure in this pipeline. Requiring the pipeline's GitHub
 status for merges is a separate repository protection setting. Fork results must
 match the revision Chalk consumes; Chalk's adapter, Velox, SQL and persistent
 compatibility tests remain in the monorepo.
+
+## Docker fixtures
+
+The workspace and integration test lanes build MinIO server/client fixture images
+from `crates/test_utils/testdata/minio/Dockerfile`. They retain server release
+`RELEASE.2025-05-24T17-08-30Z` and client release
+`RELEASE.2025-05-21T01-59-54Z`; official source commits and archive checksums, plus
+build/runtime image digests, are pinned. The images include CA certificates and
+Go's bundled timezone database. Docker's build cache reuses them across suites;
+no image publication or registry credentials are required.
+
+Run `docker compose build minio mc` from a catalog fixture directory to check the
+images independently. The normal test commands still start the real fixtures and
+fail if image construction or service startup fails.
