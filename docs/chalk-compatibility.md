@@ -21,13 +21,14 @@
 
 This branch combines the 0.8 fork's Glue/schema fixes with the native patches
 from Chalk's Iceberg coverage stack. The comparison uses Chalk commit
-`af07255dc554ca4b581098b026ca9e57d04f8a49` and fork PRs #12 and #13.
+`167b99033113232e7be9222643e4011f2746d0a6` (including the strict MERGE transaction patch)
+and fork PRs #12 and #13.
 
 | Contract | Crate implementation and regression |
 | --- | --- |
 | Dropped equality-delete keys and historical pruning | `scan/{task,context,mod}.rs`; retained-schema field IDs remain available internally, independently of visible projection. |
 | Overwrite and snapshot totals | `transaction/{overwrite,snapshot}.rs`, `spec/snapshot_summary.rs`; preserve per-manifest schemas/specs, count actual removals, retain unknown totals and check arithmetic. |
-| Table replacement during retry | `transaction/mod.rs`; refuse to replay writes onto a different table UUID. |
+| Transaction read state | `transaction/mod.rs`; refuse replacement UUIDs and preserve `RebasePolicy::Forbid` through refresh, validation-only commits, transient retries and commit construction without refresh. Default `Allow` transactions retain their rebase behavior. |
 | External Parquet without field IDs | `arrow/reader.rs`; recursive name mapping supplies field IDs consistently to projection, filters and equality deletes. |
 | Catalog errors | Glue distinguishes missing tables, absent metadata, failed reads and retryable update errors. REST create conflicts retain `TableAlreadyExists`. HTTP fixtures exercise the catalog methods. |
 | Type compatibility | Duration schemas map to long; temporal values, large string/binary constants and Glue timestamp variants retain their regression coverage. Duration schema conversion does not rescale values. |
@@ -44,9 +45,21 @@ the upstream trait's separate close implementation is unchanged.
 `bash .buildkite/ci.sh chalk-consumer` executes them and records the exact commit
 and lockfile. These tests do not replace Chalk's adapter, Velox, SQL or persistent
 table suites, and do not qualify format-v3 tables or deletion vectors. File-catalog
-publication and shared SQL MERGE behavior are outside this crate patch set.
+publication, SQL planning and duplicate-match MERGE semantics are outside this crate
+patch set.
 
 A separate existing limitation remains: apache-avro 0.20 and 0.21 both misread
 fixed-width UUID partition values in manifests as length-prefixed bytes. Restoring
 the writer format does not repair that reader bug or qualify UUID-partitioned
 tables. Nested dropped equality-delete keys also remain unsupported.
+
+`RebasePolicy::Forbid` compares the original metadata and location on each catalog
+refresh. Publication requirements protect UUID, main snapshot, schema/spec/sort
+IDs and assigned-ID counters; they cannot assert arbitrary property-only or exact
+metadata-path changes after the refresh. `into_table_commit_no_refresh` carries
+those requirements but performs no catalog refresh of its own.
+
+Chalk must pass MERGE's original validated table and select `Forbid`; porting the
+crate API alone does not update the adapter or qualify SQL MERGE on the upgraded
+build. The Chalk dependency pin and integration tests must use the intended fork
+revision.
