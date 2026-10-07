@@ -17,26 +17,19 @@
   ~ under the License.
 -->
 
-# Chalk consumer test gate
+# Chalk consumer tests
 
 `bash .buildkite/ci.sh chalk-consumer` runs the core, Glue and REST library tests
 with default features and `iceberg/storage-gcs`, matching Chalk's storage profile.
 The separate workspace test lane retains its broader all-features coverage.
 
-`required-tests.json` preserves the named cases required by Chalk's vendored-crate
-CI. Required cases must run and pass: filtering, removal, `#[ignore]`, failure and
-missing results fail the gate. Change the inventory only when intentionally
-renaming or replacing coverage; do not regenerate it from a successful test run.
+All three package commands run, and a nonzero Cargo exit status fails the lane.
+Buildkite's job output contains their results; no separate test-name inventory or
+log parser determines success.
 
-Each invocation uses a fresh directory under `target/chalk-consumer/`. Buildkite
-uploads package logs, exact commands and exit statuses, plus `evidence.json` with
-the commit, Cargo lock hash, inventory hash and named outcomes. A test process
-failure still fails the gate even if every required assertion passed before it.
-
-The lane is a hard failure in this pipeline. Requiring the pipeline's GitHub
-status for merges is a separate repository protection setting. Fork results must
-match the revision Chalk consumes; Chalk's adapter, Velox, SQL and persistent
-compatibility tests remain in the monorepo.
+Requiring the pipeline's GitHub status for merges is a separate repository
+protection setting. Fork results must match the revision Chalk consumes; Chalk's
+adapter, Velox, SQL and persistent compatibility tests remain in the monorepo.
 
 ## Docker fixtures
 

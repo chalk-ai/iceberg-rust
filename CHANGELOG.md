@@ -28,10 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Build the existing MinIO test releases from checksum-pinned official source instead of unavailable public images.
 
-- Preserve strict transaction read state for MERGE, including snapshotless validation, publication conflicts and transient retries; require its native regressions.
+- Preserve strict transaction read state for MERGE, including snapshotless validation, publication conflicts and transient retries.
 - Preserve Chalk's crate-native scan, equality-delete, transaction, summary, temporal and Glue retry regressions when replacing its vendored fork.
 - Preserve recursive Parquet name mapping, Glue/REST error classification, duration schema conversion, fixed-width UUID manifest writes, retry jitter and deletion-only manifests across the fork upgrade.
-- Require the carried-forward and compatibility regressions in the core/Glue/REST consumer CI lane and publish invocation evidence.
+- Run the core/Glue/REST consumer library tests directly and propagate Cargo failures without a duplicate test-name inventory or log-parsing gate.
 
 ## [v0.8.0] - 2026-01-06
 

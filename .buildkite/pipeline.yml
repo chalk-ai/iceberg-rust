@@ -25,7 +25,6 @@ steps:
       - label: ":iceberg: chalk consumer crates"
         key: "chalk-consumer"
         command: "bash .buildkite/ci.sh chalk-consumer"
-        artifact_paths: "target/chalk-consumer/**/*"
 
       - label: ":docker: integration tests"
         command: "bash .buildkite/ci.sh docker-integration-test"
