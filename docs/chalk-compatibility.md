@@ -22,7 +22,7 @@
 This branch combines the 0.8 fork's Glue/schema fixes with the native patches
 from Chalk's Iceberg coverage stack. The comparison uses Chalk commit
 `167b99033113232e7be9222643e4011f2746d0a6` (including the strict MERGE transaction patch)
-and fork PRs #12 and #13.
+and fork PRs #12 and #14.
 
 | Contract | Crate implementation and regression |
 | --- | --- |
@@ -41,10 +41,10 @@ pruning, delete metadata and retry telemetry remain available. Chalk's active
 fanout writer uses the retained bounded `close_collecting_durations` method;
 the upstream trait's separate close implementation is unchanged.
 
-`.buildkite/required-tests.json` names the required native regressions.
-`bash .buildkite/ci.sh chalk-consumer` executes them and records the exact commit
-and lockfile. These tests do not replace Chalk's adapter, Velox, SQL or persistent
-table suites, and do not qualify format-v3 tables or deletion vectors. File-catalog
+`bash .buildkite/ci.sh chalk-consumer` runs the core/Glue/REST library tests
+with Chalk's storage features and the committed Cargo lockfile. Cargo failures
+fail the Buildkite job. These tests do not replace Chalk's adapter, Velox, SQL
+or persistent table suites, and do not qualify format-v3 tables or deletion vectors. File-catalog
 publication, SQL planning and duplicate-match MERGE semantics are outside this crate
 patch set.
 

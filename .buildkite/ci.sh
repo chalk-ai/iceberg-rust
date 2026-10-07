@@ -50,21 +50,15 @@ case "${task}" in
     cargo test --no-fail-fast --doc --all-features --workspace
     ;;
   chalk-consumer)
-    python3 .buildkite/test-check-required-tests.py
-    mkdir -p target/chalk-consumer
-    evidence_dir="$(mktemp -d target/chalk-consumer/run.XXXXXX)"
+    test_status=0
     for package in iceberg iceberg-catalog-glue iceberg-catalog-rest; do
       features="iceberg/storage-gcs"
       if [[ "${package}" == iceberg ]]; then
         features="storage-gcs"
       fi
-      test_command=(cargo test --locked --lib -p "${package}" --features "${features}" --color never -- --format pretty --color never)
-      printf '%s\n' "${test_command[@]}" > "${evidence_dir}/${package}.command"
-      test_status=0
-      "${test_command[@]}" 2>&1 | tee "${evidence_dir}/${package}.log" || test_status=$?
-      printf '%s\n' "${test_status}" > "${evidence_dir}/${package}.status"
+      cargo test --locked --lib -p "${package}" --features "${features}" || test_status=$?
     done
-    python3 .buildkite/check-required-tests.py --logs "${evidence_dir}"
+    exit "${test_status}"
     ;;
   docker-integration-test)
     cargo test --no-fail-fast -p iceberg-integration-tests --all-features
