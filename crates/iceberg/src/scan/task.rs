@@ -78,11 +78,8 @@ pub fn schema_with_equality_delete_fields(
         // Schema IDs need not encode chronology. Reconcile legal widening promotions instead
         // of choosing whichever retained schema happens to be visited first.
         for definition in definitions {
-            field.field_type = Box::new(equality_delete_field_type(
-                id,
-                &field.field_type,
-                &definition.field_type,
-            )?);
+            *field.field_type =
+                equality_delete_field_type(id, &field.field_type, &definition.field_type)?;
         }
         field.name = format!("__iceberg_equality_delete_{id}");
         while !names.insert(field.name.to_lowercase()) {
@@ -160,6 +157,9 @@ where D: serde::Deserializer<'de> {
 /// A task to scan part of file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileScanTask {
+    /// The total size of the data file in bytes, from the manifest entry.
+    /// Used to skip a stat/HEAD request when reading Parquet footers.
+    pub file_size_in_bytes: u64,
     /// The start offset of the file to scan.
     pub start: u64,
     /// The length of the file to scan.

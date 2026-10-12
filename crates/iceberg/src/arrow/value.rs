@@ -653,6 +653,38 @@ pub(crate) fn create_primitive_array_single_element(
             Ok(Arc::new(Int64Array::from(vec![*v])))
         }
         (DataType::Int64, None) => Ok(Arc::new(Int64Array::from(vec![Option::<i64>::None]))),
+        (DataType::Timestamp(TimeUnit::Microsecond, timezone), Some(PrimitiveLiteral::Long(v))) => {
+            let array = TimestampMicrosecondArray::from(vec![*v]);
+            if let Some(timezone) = timezone {
+                Ok(Arc::new(array.with_timezone(timezone.clone())))
+            } else {
+                Ok(Arc::new(array))
+            }
+        }
+        (DataType::Timestamp(TimeUnit::Microsecond, timezone), None) => {
+            let array = TimestampMicrosecondArray::from(vec![Option::<i64>::None]);
+            if let Some(timezone) = timezone {
+                Ok(Arc::new(array.with_timezone(timezone.clone())))
+            } else {
+                Ok(Arc::new(array))
+            }
+        }
+        (DataType::Timestamp(TimeUnit::Nanosecond, timezone), Some(PrimitiveLiteral::Long(v))) => {
+            let array = TimestampNanosecondArray::from(vec![*v]);
+            if let Some(timezone) = timezone {
+                Ok(Arc::new(array.with_timezone(timezone.clone())))
+            } else {
+                Ok(Arc::new(array))
+            }
+        }
+        (DataType::Timestamp(TimeUnit::Nanosecond, timezone), None) => {
+            let array = TimestampNanosecondArray::from(vec![Option::<i64>::None]);
+            if let Some(timezone) = timezone {
+                Ok(Arc::new(array.with_timezone(timezone.clone())))
+            } else {
+                Ok(Arc::new(array))
+            }
+        }
         (DataType::Float32, Some(PrimitiveLiteral::Float(v))) => {
             Ok(Arc::new(Float32Array::from(vec![v.0])))
         }
@@ -727,6 +759,22 @@ pub(crate) fn create_primitive_array_single_element(
                         }
                         DataType::Int64 => {
                             Ok(Arc::new(Int64Array::from(vec![Option::<i64>::None])) as ArrayRef)
+                        }
+                        DataType::Timestamp(TimeUnit::Microsecond, timezone) => {
+                            let array = TimestampMicrosecondArray::from(vec![Option::<i64>::None]);
+                            if let Some(timezone) = timezone {
+                                Ok(Arc::new(array.with_timezone(timezone.clone())) as ArrayRef)
+                            } else {
+                                Ok(Arc::new(array) as ArrayRef)
+                            }
+                        }
+                        DataType::Timestamp(TimeUnit::Nanosecond, timezone) => {
+                            let array = TimestampNanosecondArray::from(vec![Option::<i64>::None]);
+                            if let Some(timezone) = timezone {
+                                Ok(Arc::new(array.with_timezone(timezone.clone())) as ArrayRef)
+                            } else {
+                                Ok(Arc::new(array) as ArrayRef)
+                            }
                         }
                         DataType::Float32 => {
                             Ok(Arc::new(Float32Array::from(vec![Option::<f32>::None])) as ArrayRef)
@@ -1823,6 +1871,32 @@ mod test {
             other => panic!("Expected Decimal128, got {other:?}"),
         }
 
+        assert_eq!(array.len(), num_rows);
+    }
+
+    #[test]
+    fn test_create_timestamp_microsecond_array_repeated() {
+        let target_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let value = PrimitiveLiteral::Long(1_740_600_000_000_000);
+        let num_rows = 3;
+
+        let array = create_primitive_array_repeated(&target_type, &Some(value), num_rows)
+            .expect("Failed to create repeated timestamp microsecond array");
+
+        assert_eq!(array.data_type(), &target_type);
+        assert_eq!(array.len(), num_rows);
+    }
+
+    #[test]
+    fn test_create_timestamp_microsecond_with_timezone_array_repeated() {
+        let target_type = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let value = PrimitiveLiteral::Long(1_740_600_000_000_000);
+        let num_rows = 2;
+
+        let array = create_primitive_array_repeated(&target_type, &Some(value), num_rows)
+            .expect("Failed to create repeated timestamp microsecond array with timezone");
+
+        assert_eq!(array.data_type(), &target_type);
         assert_eq!(array.len(), num_rows);
     }
 }

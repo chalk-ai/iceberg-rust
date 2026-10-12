@@ -19,8 +19,9 @@
 
 # Chalk consumer tests
 
-`bash .buildkite/ci.sh chalk-consumer` runs the core, Glue and REST library tests
-with default features and `iceberg/storage-gcs`, matching Chalk's storage profile.
+`bash .buildkite/ci.sh chalk-consumer` runs the core, Glue, REST, and OpenDAL
+storage library tests, enabling `iceberg-storage-opendal/opendal-gcs` to match
+Chalk's storage profile.
 The separate workspace test lane retains its broader all-features coverage.
 
 All three package commands run, and a nonzero Cargo exit status fails the lane.
@@ -31,9 +32,21 @@ Requiring the pipeline's GitHub status for merges is a separate repository
 protection setting. Fork results must match the revision Chalk consumes; Chalk's
 adapter, Velox, SQL and persistent compatibility tests remain in the monorepo.
 
+## Test lanes
+
+`bash .buildkite/ci.sh test` runs the regular workspace test suite without
+Docker-backed catalog and object-store integration tests. It still runs the
+library tests for Glue, HMS, REST, and OpenDAL storage packages so crate-local
+unit coverage stays in the hard-required lane.
+
+`bash .buildkite/ci.sh docker-integration-test` starts the shared Docker fixtures,
+runs the external-service catalog and object-store integration tests, and tears
+the fixtures down afterward. This lane owns tests that connect to REST, Glue,
+Hive Metastore, MinIO, or the GCS emulator.
+
 ## Docker fixtures
 
-The workspace and integration test lanes build MinIO server/client fixture images
+The Docker integration test lane builds MinIO server/client fixture images
 from `crates/test_utils/testdata/minio/Dockerfile`. They retain server release
 `RELEASE.2025-05-24T17-08-30Z` and client release
 `RELEASE.2025-05-21T01-59-54Z`; official source commits and archive checksums, plus
@@ -42,5 +55,5 @@ Go's bundled timezone database. Docker's build cache reuses them across suites;
 no image publication or registry credentials are required.
 
 Run `docker compose build minio mc` from a catalog fixture directory to check the
-images independently. The normal test commands still start the real fixtures and
-fail if image construction or service startup fails.
+images independently. The Docker integration test lane starts the real fixtures
+and fails if image construction or service startup fails.
