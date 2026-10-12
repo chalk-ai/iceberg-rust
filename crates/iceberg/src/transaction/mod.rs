@@ -400,7 +400,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use crate::catalog::MockCatalog;
-    use crate::io::FileIOBuilder;
+    use crate::io::FileIO;
     use crate::spec::{
         MAIN_BRANCH, NestedField, Operation, PrimitiveType, Schema, Snapshot, SnapshotReference,
         SnapshotRetention, SortOrder, Summary, TableMetadata, Transform, Type,

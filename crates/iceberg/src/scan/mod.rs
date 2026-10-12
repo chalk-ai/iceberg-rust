@@ -1416,7 +1416,7 @@ pub mod tests {
         for reuse_name in [false, true] {
             let directory = TempDir::new().unwrap();
             let location = directory.path().to_str().unwrap().to_string();
-            let file_io = FileIO::from_path(&location).unwrap().build().unwrap();
+            let file_io = FileIO::from_path(&location).unwrap().build();
             let original_schema = Schema::builder()
                 .with_fields([
                     Arc::new(NestedField::optional(

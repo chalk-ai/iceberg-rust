@@ -1000,7 +1000,7 @@ mod tests {
                 props: HashMap::new(),
             },
             client: GlueClient(aws_sdk_glue::Client::from_conf(sdk_config)),
-            file_io: FileIO::from_path(warehouse).unwrap().build().unwrap(),
+            file_io: FileIO::from_path(warehouse).unwrap().build(),
         }
     }
 
@@ -1150,17 +1150,18 @@ mod tests {
         let mut server = Server::new_async().await;
         let directory = tempfile::tempdir().unwrap();
         let mut catalog = test_catalog(&server, directory.path().to_str().unwrap());
-        catalog.file_io = FileIO::from_path("s3://warehouse")
-            .unwrap()
-            .with_prop(S3_ENDPOINT, server.url())
-            .with_prop(S3_REGION, "us-east-1")
-            .with_prop(S3_ACCESS_KEY_ID, "test")
-            .with_prop(S3_SECRET_ACCESS_KEY, "test")
-            .with_prop(S3_PATH_STYLE_ACCESS, "true")
-            .with_prop(S3_DISABLE_CONFIG_LOAD, "true")
-            .with_prop(S3_DISABLE_EC2_METADATA, "true")
-            .build()
-            .unwrap();
+        catalog.file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+            configured_scheme: "s3".to_string(),
+            customized_credential_load: None,
+        }))
+        .with_prop(S3_ENDPOINT, server.url())
+        .with_prop(S3_REGION, "us-east-1")
+        .with_prop(S3_ACCESS_KEY_ID, "test")
+        .with_prop(S3_SECRET_ACCESS_KEY, "test")
+        .with_prop(S3_PATH_STYLE_ACCESS, "true")
+        .with_prop(S3_DISABLE_CONFIG_LOAD, "true")
+        .with_prop(S3_DISABLE_EC2_METADATA, "true")
+        .build();
         let table_response = server
             .mock("POST", "/")
             .match_header("x-amz-target", "AWSGlue.GetTable")

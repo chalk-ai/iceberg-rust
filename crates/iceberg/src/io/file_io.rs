@@ -23,7 +23,7 @@ use bytes::Bytes;
 use super::storage::{
     LocalFsStorageFactory, MemoryStorageFactory, Storage, StorageConfig, StorageFactory,
 };
-use crate::Result;
+use crate::{Error, ErrorKind, Result};
 
 /// FileIO implementation, used to manipulate files in underlying storage.
 ///
@@ -69,6 +69,27 @@ pub struct FileIO {
 }
 
 impl FileIO {
+    /// Try to infer file IO from a path supported by the core crate.
+    ///
+    /// Core `iceberg` supports local filesystem and memory storage. Object-store
+    /// schemes are provided by `iceberg-storage-opendal`.
+    pub fn from_path(path: impl AsRef<str>) -> Result<FileIOBuilder> {
+        let path = path.as_ref();
+        if path.starts_with("memory:") {
+            return Ok(FileIOBuilder::new(Arc::new(MemoryStorageFactory)));
+        }
+        if path.starts_with("file:") || !path.contains("://") {
+            return Ok(FileIOBuilder::new(Arc::new(LocalFsStorageFactory)));
+        }
+
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!(
+                "Storage scheme for {path} is not supported by iceberg core; use iceberg-storage-opendal"
+            ),
+        ))
+    }
+
     /// Create a new FileIO backed by in-memory storage.
     ///
     /// This is useful for testing scenarios where persistent storage is not needed.

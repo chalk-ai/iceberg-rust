@@ -3601,12 +3601,12 @@ message schema {
         );
         let file_io = FileIO::from_path(directory.path().to_str().unwrap())
             .unwrap()
-            .build()
-            .unwrap();
+            .build();
         for with_filter in [false, true] {
             for with_delete in [false, true] {
                 for row_selection in [false, true] {
                     let task = FileScanTask {
+                        file_size_in_bytes: std::fs::metadata(&path).unwrap().len(),
                         start: 0,
                         length: 0,
                         record_count: Some(3),
@@ -3625,6 +3625,7 @@ message schema {
                                 file_path: delete_path.to_str().unwrap().to_owned(),
                                 file_type: DataContentType::EqualityDeletes,
                                 equality_ids: Some(vec![1]),
+                                file_size_in_bytes: std::fs::metadata(&delete_path).unwrap().len(),
                                 ..Default::default()
                             }]
                         } else {
@@ -3760,12 +3761,12 @@ message schema {
         writer.close().unwrap();
         let file_io = FileIO::from_path(directory.path().to_str().unwrap())
             .unwrap()
-            .build()
-            .unwrap();
+            .build();
         let iceberg_schema = Arc::new(arrow_schema_to_schema(&mapped).unwrap());
         let mapping = Arc::new(mapping);
         for (index, field_id) in [10, 20, 30].into_iter().enumerate() {
             let task = FileScanTask {
+                file_size_in_bytes: std::fs::metadata(&path).unwrap().len(),
                 start: 0,
                 length: 0,
                 record_count: Some(1),
@@ -4613,6 +4614,8 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                data_file: None,
+                data_sequence_number: None,
             }),
             Ok(FileScanTask {
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_1.parquet"))
@@ -4631,6 +4634,8 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                data_file: None,
+                data_sequence_number: None,
             }),
             Ok(FileScanTask {
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_2.parquet"))
@@ -4649,6 +4654,8 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                data_file: None,
+                data_sequence_number: None,
             }),
         ];
 
