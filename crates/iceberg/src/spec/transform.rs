@@ -25,6 +25,7 @@ use chrono::{NaiveDate, TimeDelta};
 use fnv::FnvHashSet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::values::decimal_utils::decimal_from_i128_with_scale;
 use super::{Datum, PrimitiveLiteral};
 use crate::ErrorKind;
 use crate::error::{Error, Result};
@@ -48,7 +49,7 @@ use crate::transform::{BoxedTransformFunction, create_transform_function};
 /// predicates and partition predicates.
 ///
 /// All transforms must return `null` for a `null` input value.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum Transform {
     /// Source value, unmodified
     ///
@@ -682,7 +683,7 @@ impl Transform {
                 (PrimitiveType::Int, PrimitiveLiteral::Int(v)) => Some(Datum::int(v - 1)),
                 (PrimitiveType::Long, PrimitiveLiteral::Long(v)) => Some(Datum::long(v - 1)),
                 (PrimitiveType::Decimal { .. }, PrimitiveLiteral::Int128(v)) => {
-                    Some(Datum::decimal(v - 1)?)
+                    Some(Datum::decimal(decimal_from_i128_with_scale(v - 1, 0))?)
                 }
                 (PrimitiveType::Date, PrimitiveLiteral::Int(v)) => Some(Datum::date(v - 1)),
                 (PrimitiveType::Timestamp, PrimitiveLiteral::Long(v)) => {
@@ -703,7 +704,7 @@ impl Transform {
                 (PrimitiveType::Int, PrimitiveLiteral::Int(v)) => Some(Datum::int(v + 1)),
                 (PrimitiveType::Long, PrimitiveLiteral::Long(v)) => Some(Datum::long(v + 1)),
                 (PrimitiveType::Decimal { .. }, PrimitiveLiteral::Int128(v)) => {
-                    Some(Datum::decimal(v + 1)?)
+                    Some(Datum::decimal(decimal_from_i128_with_scale(v + 1, 0))?)
                 }
                 (PrimitiveType::Date, PrimitiveLiteral::Int(v)) => Some(Datum::date(v + 1)),
                 (PrimitiveType::Timestamp, PrimitiveLiteral::Long(v)) => {
@@ -846,7 +847,9 @@ impl Transform {
         match (datum.data_type(), datum.literal()) {
             (PrimitiveType::Int, PrimitiveLiteral::Int(v)) => Ok(Datum::int(v + 1)),
             (PrimitiveType::Long, PrimitiveLiteral::Long(v)) => Ok(Datum::long(v + 1)),
-            (PrimitiveType::Decimal { .. }, PrimitiveLiteral::Int128(v)) => Datum::decimal(v + 1),
+            (PrimitiveType::Decimal { .. }, PrimitiveLiteral::Int128(v)) => {
+                Datum::decimal(decimal_from_i128_with_scale(v + 1, 0))
+            }
             (PrimitiveType::Date, PrimitiveLiteral::Int(v)) => Ok(Datum::date(v + 1)),
             (PrimitiveType::Timestamp, PrimitiveLiteral::Long(v)) => {
                 Ok(Datum::timestamp_micros(v + 1))
@@ -882,7 +885,9 @@ impl Transform {
         match (datum.data_type(), datum.literal()) {
             (PrimitiveType::Int, PrimitiveLiteral::Int(v)) => Ok(Datum::int(v - 1)),
             (PrimitiveType::Long, PrimitiveLiteral::Long(v)) => Ok(Datum::long(v - 1)),
-            (PrimitiveType::Decimal { .. }, PrimitiveLiteral::Int128(v)) => Datum::decimal(v - 1),
+            (PrimitiveType::Decimal { .. }, PrimitiveLiteral::Int128(v)) => {
+                Datum::decimal(decimal_from_i128_with_scale(v - 1, 0))
+            }
             (PrimitiveType::Date, PrimitiveLiteral::Int(v)) => Ok(Datum::date(v - 1)),
             (PrimitiveType::Timestamp, PrimitiveLiteral::Long(v)) => {
                 Ok(Datum::timestamp_micros(v - 1))

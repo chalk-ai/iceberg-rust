@@ -70,7 +70,7 @@ use std::time::Duration;
 
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
 
-use crate::error::Result;
+use crate::error::{Error, ErrorKind, Result};
 use crate::spec::{MAIN_BRANCH, TableProperties, UnboundPartitionSpec};
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
@@ -83,7 +83,7 @@ use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
-use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
+use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
 
 /// Whether transaction actions may be reapplied to a newer table state.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -219,10 +219,7 @@ impl Transaction {
             return Ok(self.table);
         }
 
-        let table_props =
-            TableProperties::try_from(self.table.metadata().properties()).map_err(|e| {
-                Error::new(ErrorKind::DataInvalid, "Invalid table properties").with_source(e)
-            })?;
+        let table_props = self.table.metadata().table_properties()?;
 
         let backoff = Self::build_backoff(table_props)?;
         let tx = self;
@@ -427,7 +424,7 @@ mod tests {
             .metadata(resp)
             .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
-            .file_io(FileIOBuilder::new("memory").build().unwrap())
+            .file_io(FileIO::new_with_memory())
             .build()
             .unwrap()
     }
@@ -446,7 +443,7 @@ mod tests {
             .metadata(resp)
             .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
-            .file_io(FileIOBuilder::new("memory").build().unwrap())
+            .file_io(FileIO::new_with_memory())
             .build()
             .unwrap()
     }
@@ -465,7 +462,7 @@ mod tests {
             .metadata(resp)
             .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
-            .file_io(FileIOBuilder::new("memory").build().unwrap())
+            .file_io(FileIO::new_with_memory())
             .build()
             .unwrap()
     }
