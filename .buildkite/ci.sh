@@ -52,12 +52,9 @@ case "${task}" in
   chalk-consumer)
     test_status=0
     for package in iceberg iceberg-catalog-glue iceberg-catalog-rest; do
-      features="iceberg/storage-gcs"
-      if [[ "${package}" == iceberg ]]; then
-        features="storage-gcs"
-      fi
-      cargo test --locked --lib -p "${package}" --features "${features}" || test_status=$?
+      cargo test --locked --lib -p "${package}" || test_status=$?
     done
+    cargo test --locked --lib -p iceberg-storage-opendal --features opendal-gcs || test_status=$?
     exit "${test_status}"
     ;;
   docker-integration-test)

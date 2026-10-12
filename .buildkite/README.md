@@ -19,8 +19,9 @@
 
 # Chalk consumer tests
 
-`bash .buildkite/ci.sh chalk-consumer` runs the core, Glue and REST library tests
-with default features and `iceberg/storage-gcs`, matching Chalk's storage profile.
+`bash .buildkite/ci.sh chalk-consumer` runs the core, Glue, REST, and OpenDAL
+storage library tests, enabling `iceberg-storage-opendal/opendal-gcs` to match
+Chalk's storage profile.
 The separate workspace test lane retains its broader all-features coverage.
 
 All three package commands run, and a nonzero Cargo exit status fails the lane.
