@@ -274,14 +274,33 @@ impl OpenDalStorage {
                 let op = s3_config_build(config, customized_credential_load, path)?;
                 let op_info = op.info();
 
-                // Check prefix of s3 path.
-                let prefix = format!("{}://{}/", configured_scheme, op_info.name());
-                if path.starts_with(&prefix) {
+                // S3 paths may arrive as either s3:// or s3a:// through catalog metadata.
+                // Both address the same opendal backend; keep the configured scheme for
+                // generated paths but accept either alias when resolving existing locations.
+                let bucket = op_info.name();
+                let prefixes = [
+                    format!("{}://{bucket}/", configured_scheme),
+                    format!(
+                        "{}://{bucket}/",
+                        if configured_scheme == "s3" {
+                            "s3a"
+                        } else {
+                            "s3"
+                        }
+                    ),
+                ];
+                if let Some(prefix) = prefixes
+                    .iter()
+                    .find(|prefix| path.starts_with(prefix.as_str()))
+                {
                     (op, &path[prefix.len()..])
                 } else {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Invalid s3 url: {path}, should start with {prefix}"),
+                        format!(
+                            "Invalid s3 url: {path}, should start with {}",
+                            prefixes.join(" or ")
+                        ),
                     ));
                 }
             }
