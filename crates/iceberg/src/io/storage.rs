@@ -37,6 +37,8 @@ use opendal::{Operator, Scheme};
 #[cfg(feature = "storage-azdls")]
 use super::AzureStorageScheme;
 use super::FileIOBuilder;
+#[cfg(feature = "storage-hdfs-native")]
+use super::storage_hdfs_native::HdfsNativeOperators;
 #[cfg(feature = "storage-s3")]
 use crate::io::CustomAwsCredentialLoader;
 use crate::{Error, ErrorKind};
@@ -71,6 +73,9 @@ pub(crate) enum Storage {
         configured_scheme: AzureStorageScheme,
         config: Arc<AzdlsConfig>,
     },
+    /// Expects paths of the form `hdfs://<authority>/<path>` or `viewfs://<authority>/<path>`.
+    #[cfg(feature = "storage-hdfs-native")]
+    HdfsNative { operators: HdfsNativeOperators },
 }
 
 impl Storage {
@@ -109,6 +114,10 @@ impl Storage {
                     configured_scheme: scheme,
                 })
             }
+            #[cfg(feature = "storage-hdfs-native")]
+            Scheme::HdfsNative => Ok(Self::HdfsNative {
+                operators: HdfsNativeOperators::default(),
+            }),
             // Update doc on [`FileIO`] when adding new schemes.
             _ => Err(Error::new(
                 ErrorKind::FeatureUnsupported,
@@ -207,12 +216,15 @@ impl Storage {
                 configured_scheme,
                 config,
             } => super::azdls_create_operator(path, config, configured_scheme),
+            #[cfg(feature = "storage-hdfs-native")]
+            Storage::HdfsNative { operators } => operators.create_operator(path),
             #[cfg(all(
                 not(feature = "storage-s3"),
                 not(feature = "storage-fs"),
                 not(feature = "storage-gcs"),
                 not(feature = "storage-oss"),
                 not(feature = "storage-azdls"),
+                not(feature = "storage-hdfs-native"),
             ))]
             _ => Err(Error::new(
                 ErrorKind::FeatureUnsupported,
@@ -236,6 +248,7 @@ impl Storage {
             "gs" | "gcs" => Ok(Scheme::Gcs),
             "oss" => Ok(Scheme::Oss),
             "abfss" | "abfs" | "wasbs" | "wasb" => Ok(Scheme::Azdls),
+            "hdfs" | "viewfs" => Ok(Scheme::HdfsNative),
             s => Ok(s.parse::<Scheme>()?),
         }
     }

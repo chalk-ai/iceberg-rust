@@ -78,6 +78,8 @@ mod storage_azdls;
 mod storage_fs;
 #[cfg(feature = "storage-gcs")]
 mod storage_gcs;
+#[cfg(feature = "storage-hdfs-native")]
+mod storage_hdfs_native;
 #[cfg(feature = "storage-memory")]
 mod storage_memory;
 #[cfg(feature = "storage-oss")]
