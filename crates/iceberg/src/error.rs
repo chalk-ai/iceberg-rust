@@ -390,12 +390,6 @@ define_from_err!(
 );
 
 define_from_err!(
-    opendal::Error,
-    ErrorKind::Unexpected,
-    "Failure in doing io operation"
-);
-
-define_from_err!(
     url::ParseError,
     ErrorKind::DataInvalid,
     "Failed to parse url"
@@ -411,12 +405,6 @@ define_from_err!(
     serde_json::Error,
     ErrorKind::DataInvalid,
     "Failed to parse json string"
-);
-
-define_from_err!(
-    rust_decimal::Error,
-    ErrorKind::DataInvalid,
-    "Failed to convert decimal literal to rust decimal"
 );
 
 define_from_err!(

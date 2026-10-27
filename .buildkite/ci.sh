@@ -44,7 +44,21 @@ case "${task}" in
     cargo build -p iceberg --no-default-features
     ;;
   test)
-    cargo test --no-fail-fast --all-targets --all-features --workspace --exclude iceberg-integration-tests
+    test_status=0
+    cargo test \
+      --no-fail-fast \
+      --all-targets \
+      --all-features \
+      --workspace \
+      --exclude iceberg-catalog-glue \
+      --exclude iceberg-catalog-hms \
+      --exclude iceberg-catalog-rest \
+      --exclude iceberg-integration-tests \
+      --exclude iceberg-storage-opendal || test_status=$?
+    for package in iceberg-catalog-glue iceberg-catalog-hms iceberg-catalog-rest iceberg-storage-opendal; do
+      cargo test --no-fail-fast --lib --all-features -p "${package}" || test_status=$?
+    done
+    exit "${test_status}"
     ;;
   doc-test)
     cargo test --no-fail-fast --doc --all-features --workspace
@@ -52,16 +66,21 @@ case "${task}" in
   chalk-consumer)
     test_status=0
     for package in iceberg iceberg-catalog-glue iceberg-catalog-rest; do
-      features="iceberg/storage-gcs"
-      if [[ "${package}" == iceberg ]]; then
-        features="storage-gcs"
-      fi
-      cargo test --locked --lib -p "${package}" --features "${features}" || test_status=$?
+      cargo test --locked --lib -p "${package}" || test_status=$?
     done
+    cargo test --locked --lib -p iceberg-storage-opendal --features opendal-gcs || test_status=$?
     exit "${test_status}"
     ;;
   docker-integration-test)
-    cargo test --no-fail-fast -p iceberg-integration-tests --all-features
+    test_status=0
+    trap 'make docker-down' EXIT
+    make docker-up
+    cargo test --no-fail-fast -p iceberg-integration-tests --all-features || test_status=$?
+    cargo test --no-fail-fast -p iceberg-catalog-glue --test glue_catalog_test || test_status=$?
+    cargo test --no-fail-fast -p iceberg-catalog-hms --test hms_catalog_test || test_status=$?
+    cargo test --no-fail-fast -p iceberg-catalog-rest --test rest_catalog_test || test_status=$?
+    cargo test --no-fail-fast -p iceberg-storage-opendal --all-features --test file_io_gcs_test --test file_io_s3_test || test_status=$?
+    exit "${test_status}"
     ;;
   cargo-machete)
     ensure_cargo_bin cargo-machete cargo-machete@0.7.0 --locked
