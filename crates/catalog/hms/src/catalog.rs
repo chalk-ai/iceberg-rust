@@ -229,6 +229,25 @@ impl HmsCatalog {
     pub fn file_io(&self) -> FileIO {
         self.file_io.clone()
     }
+
+    async fn load_hive_table(
+        &self,
+        db_name: &str,
+        table_name: &str,
+    ) -> Result<hive_metastore::Table> {
+        Ok(self
+            .client
+            .0
+            .get_table_req(GetTableRequest {
+                db_name: db_name.to_string().into(),
+                tbl_name: table_name.to_string().into(),
+                ..Default::default()
+            })
+            .await
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??
+            .table)
+    }
 }
 
 #[async_trait]
@@ -506,18 +525,7 @@ impl Catalog for HmsCatalog {
     async fn load_table(&self, table: &TableIdent) -> Result<Table> {
         let db_name = validate_namespace(table.namespace())?;
 
-        let hive_table = self
-            .client
-            .0
-            .get_table_req(GetTableRequest {
-                db_name: db_name.clone().into(),
-                tbl_name: table.name.clone().into(),
-                ..Default::default()
-            })
-            .await
-            .map(from_thrift_exception)
-            .map_err(from_thrift_error)??
-            .table;
+        let hive_table = self.load_hive_table(&db_name, table.name()).await?;
 
         let metadata_location = get_metadata_location(&hive_table.parameters)?;
 
@@ -631,19 +639,73 @@ impl Catalog for HmsCatalog {
 
     async fn register_table(
         &self,
-        _table_ident: &TableIdent,
-        _metadata_location: String,
+        table_ident: &TableIdent,
+        metadata_location: String,
     ) -> Result<Table> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Registering a table is not supported yet",
-        ))
+        let db_name = validate_namespace(table_ident.namespace())?;
+        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
+        let hive_table = convert_to_hive_table(
+            db_name,
+            metadata.current_schema(),
+            table_ident.name().to_string(),
+            metadata.location().to_string(),
+            metadata_location.clone(),
+            metadata.properties(),
+        )?;
+
+        self.client
+            .0
+            .create_table(hive_table)
+            .await
+            .map_err(from_thrift_error)?;
+
+        Table::builder()
+            .file_io(self.file_io())
+            .metadata_location(metadata_location)
+            .metadata(metadata)
+            .identifier(table_ident.clone())
+            .build()
     }
 
-    async fn update_table(&self, _commit: TableCommit) -> Result<Table> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Updating a table is not supported yet",
-        ))
+    async fn update_table(&self, commit: TableCommit) -> Result<Table> {
+        let table_ident = commit.identifier().clone();
+        let db_name = validate_namespace(table_ident.namespace())?;
+        let hive_table = self.load_hive_table(&db_name, table_ident.name()).await?;
+        let metadata_location = get_metadata_location(&hive_table.parameters)?;
+        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
+        let current_table = Table::builder()
+            .file_io(self.file_io())
+            .metadata_location(metadata_location)
+            .metadata(metadata)
+            .identifier(table_ident.clone())
+            .build()?;
+
+        let staged_table = commit.apply(current_table)?;
+        let staged_metadata_location = staged_table.metadata_location_result()?.to_string();
+        staged_table
+            .metadata()
+            .write_to(staged_table.file_io(), &staged_metadata_location)
+            .await?;
+
+        let updated_hive_table = convert_to_hive_table(
+            db_name.clone(),
+            staged_table.metadata().current_schema(),
+            table_ident.name().to_string(),
+            staged_table.metadata().location().to_string(),
+            staged_metadata_location,
+            staged_table.metadata().properties(),
+        )?;
+
+        self.client
+            .0
+            .alter_table(
+                db_name.into(),
+                table_ident.name().to_string().into(),
+                updated_hive_table,
+            )
+            .await
+            .map_err(from_thrift_error)?;
+
+        Ok(staged_table)
     }
 }
