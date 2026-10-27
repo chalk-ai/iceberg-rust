@@ -1,0 +1,23 @@
+<!--
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements. See the NOTICE file distributed with
+   this work for additional information regarding copyright ownership.
+-->
+<configuration>
+    <property>
+        <name>dfs.replication</name>
+        <value>1</value>
+    </property>
+    <property>
+        <name>dfs.permissions.enabled</name>
+        <value>false</value>
+    </property>
+    <property>
+        <name>dfs.namenode.name.dir</name>
+        <value>file:///tmp/hadoop-root/dfs/name</value>
+    </property>
+    <property>
+        <name>dfs.datanode.data.dir</name>
+        <value>file:///tmp/hadoop-root/dfs/data</value>
+    </property>
+</configuration>
