@@ -77,7 +77,10 @@ case "${task}" in
     make docker-up
     cargo test --no-fail-fast -p iceberg-integration-tests --all-features || test_status=$?
     cargo test --no-fail-fast -p iceberg-catalog-glue --test glue_catalog_test || test_status=$?
-    cargo test --no-fail-fast -p iceberg-catalog-hms --test hms_catalog_test || test_status=$?
+    for hms_endpoint in localhost:9083 localhost:9084; do
+      ICEBERG_TEST_HMS_ENDPOINT="${hms_endpoint}" \
+        cargo test --no-fail-fast -p iceberg-catalog-hms --test hms_catalog_test || test_status=$?
+    done
     cargo test --no-fail-fast -p iceberg-catalog-rest --test rest_catalog_test || test_status=$?
     cargo test --no-fail-fast -p iceberg-storage-opendal --all-features --test file_io_gcs_test --test file_io_s3_test || test_status=$?
     exit "${test_status}"

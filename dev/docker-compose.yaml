@@ -133,6 +133,30 @@ services:
       retries: 20
       start_period: 30s
 
+  # Hive 3.1.3 compatibility target. Keep this service separate so the HMS
+  # catalog test suite can run against both supported server generations.
+  hive-metastore-3:
+    build:
+      context: ./hms
+      dockerfile: Dockerfile-3.1.3
+    platform: ${DOCKER_DEFAULT_PLATFORM:-linux/amd64}
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      iceberg_test:
+    ports:
+      - "9084:9083"
+    environment:
+      SERVICE_NAME: "metastore"
+      SERVICE_OPTS: "-Dmetastore.warehouse.dir=s3a://warehouse/hive/"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "cat < /dev/null > /dev/tcp/localhost/9083"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
   # =============================================================================
   # HDFS - single-node NameNode + DataNode for native HDFS tests
   # =============================================================================
