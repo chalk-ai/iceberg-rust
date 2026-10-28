@@ -164,6 +164,7 @@ services:
   # which is not routable through a bridge network. Host networking keeps the
   # fixture usable on Linux; the integration tests remain ignored elsewhere.
   hdfs-namenode:
+    profiles: ["hdfs"]
     build:
       context: ./hdfs
       dockerfile: Dockerfile
@@ -182,6 +183,7 @@ services:
       start_period: 30s
 
   hdfs-datanode:
+    profiles: ["hdfs"]
     build:
       context: ./hdfs
       dockerfile: Dockerfile
@@ -193,9 +195,6 @@ services:
         condition: service_healthy
     extra_hosts:
       - "docker-desktop:127.0.0.1"
-    volumes:
-      - ./hdfs/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
-      - ./hdfs/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
     healthcheck:
       test: ["CMD-SHELL", "hdfs dfsadmin -report | grep -q 'Live datanodes (1)'"]
       interval: 5s
