@@ -167,7 +167,7 @@ services:
     build:
       context: ./hdfs
       dockerfile: Dockerfile
-    image: dev-hdfs:3.5.0
+    image: dev-hdfs-namenode:3.5.0
     network_mode: "host"
     command: ["hdfs", "namenode"]
     environment:
@@ -185,7 +185,7 @@ services:
     build:
       context: ./hdfs
       dockerfile: Dockerfile
-    image: dev-hdfs:3.5.0
+    image: dev-hdfs-datanode:3.5.0
     network_mode: "host"
     command: ["hdfs", "datanode"]
     depends_on:
