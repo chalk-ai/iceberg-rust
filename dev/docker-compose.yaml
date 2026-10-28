@@ -164,16 +164,16 @@ services:
   # which is not routable through a bridge network. Host networking keeps the
   # fixture usable on Linux; the integration tests remain ignored elsewhere.
   hdfs-namenode:
-    image: apache/hadoop:3.5.0
+    build:
+      context: ./hdfs
+      dockerfile: Dockerfile
+    image: dev-hdfs:3.5.0
     network_mode: "host"
     command: ["hdfs", "namenode"]
     environment:
       ENSURE_NAMENODE_DIR: "/tmp/hadoop-root/dfs/name"
     extra_hosts:
       - "docker-desktop:127.0.0.1"
-    volumes:
-      - ./hdfs/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
-      - ./hdfs/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
     healthcheck:
       test: ["CMD-SHELL", "hdfs dfsadmin -safemode get | grep -q OFF"]
       interval: 5s
@@ -182,7 +182,10 @@ services:
       start_period: 30s
 
   hdfs-datanode:
-    image: apache/hadoop:3.5.0
+    build:
+      context: ./hdfs
+      dockerfile: Dockerfile
+    image: dev-hdfs:3.5.0
     network_mode: "host"
     command: ["hdfs", "datanode"]
     depends_on:
