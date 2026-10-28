@@ -48,7 +48,7 @@ services:
       - "9001:9001"
     command: ["server", "/data", "--console-address", ":9001"]
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "wget", "--spider", "--quiet", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 5
