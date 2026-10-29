@@ -206,6 +206,40 @@ pub(crate) fn convert_to_hive_table(
     })
 }
 
+/// Applies an Iceberg metadata update to an existing Hive table record.
+///
+/// HMS treats fields such as `partition_keys` as part of the table identity.
+/// Preserve the record returned by HMS and replace only the storage descriptor
+/// and parameters owned by the Iceberg catalog.
+pub(crate) fn update_hive_table(
+    mut table: hive_metastore::Table,
+    schema: &Schema,
+    location: String,
+    metadata_location: String,
+    properties: &HashMap<String, String>,
+) -> Result<hive_metastore::Table> {
+    let updated = convert_to_hive_table(
+        table
+            .db_name
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Hive table database is missing"))?
+            .to_string(),
+        schema,
+        table
+            .table_name
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Hive table name is missing"))?
+            .to_string(),
+        location,
+        metadata_location,
+        properties,
+    )?;
+
+    table.sd = updated.sd;
+    table.parameters = updated.parameters;
+    Ok(table)
+}
+
 /// Checks if provided `NamespaceIdent` is valid.
 pub(crate) fn validate_namespace(namespace: &NamespaceIdent) -> Result<String> {
     let name = namespace.as_ref();
@@ -385,6 +419,46 @@ mod tests {
         assert_eq!(result.owner, Some(HMS_DEFAULT_DB_OWNER.into()));
         assert_eq!(result.sd, Some(sd));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_hive_table_preserves_existing_fields() -> Result<()> {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "foo", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()?;
+        let mut existing = convert_to_hive_table(
+            "my_db".to_string(),
+            &schema,
+            "my_table".to_string(),
+            "hdfs://warehouse/my_table".to_string(),
+            "hdfs://warehouse/my_table/metadata/v1.metadata.json".to_string(),
+            &HashMap::new(),
+        )?;
+        existing.partition_keys = Some(vec![]);
+        existing.owner = Some("existing-owner".into());
+
+        let updated = update_hive_table(
+            existing,
+            &schema,
+            "hdfs://warehouse/my_table".to_string(),
+            "hdfs://warehouse/my_table/metadata/v2.metadata.json".to_string(),
+            &HashMap::new(),
+        )?;
+
+        assert_eq!(updated.partition_keys, Some(vec![]));
+        assert_eq!(updated.owner.as_deref(), Some("existing-owner"));
+        assert_eq!(
+            updated
+                .parameters
+                .as_ref()
+                .and_then(|params| params.get(METADATA_LOCATION))
+                .map(ToString::to_string),
+            Some("hdfs://warehouse/my_table/metadata/v2.metadata.json".to_string())
+        );
         Ok(())
     }
 

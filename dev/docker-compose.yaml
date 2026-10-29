@@ -237,7 +237,7 @@ services:
   spark-iceberg:
     build:
       context: ./spark
-      dockerfile: Dockerfile
+      dockerfile: provision.Dockerfile
     networks:
       iceberg_test:
     depends_on:
@@ -261,16 +261,18 @@ services:
 
   # Provision service - creates test data via Spark
   provision:
-    image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    image: dev-spark-provision:4.0.1
     networks:
       iceberg_test:
     depends_on:
       spark-iceberg:
         condition: service_healthy
-    entrypoint: ["/bin/sh", "-c", "uv run /opt/spark/provision.py && touch /tmp/provision_complete && tail -f /dev/null"]
+    entrypoint: ["/bin/sh", "-c", "python /opt/spark/provision.py && touch /tmp/provision_complete && tail -f /dev/null"]
     volumes:
       - ./spark/provision.py:/opt/spark/provision.py:ro
-      - uv-cache:/root/.cache/uv
     healthcheck:
       test: ["CMD-SHELL", "[ -f /tmp/provision_complete ]"]
       interval: 2s
@@ -278,5 +280,4 @@ services:
       retries: 90
       start_period: 20s
 
-volumes:
-  uv-cache:
+volumes: {}

@@ -83,6 +83,10 @@ case "${task}" in
     done
     cargo test --no-fail-fast -p iceberg-catalog-rest --test rest_catalog_test || test_status=$?
     cargo test --no-fail-fast -p iceberg-storage-opendal --all-features --test file_io_gcs_test --test file_io_s3_test || test_status=$?
+    if [[ "$(uname -s)" == "Linux" ]]; then
+      docker compose -f dev/docker-compose.yaml --profile hdfs up -d --build --wait hdfs-namenode hdfs-datanode || test_status=$?
+      cargo test --no-fail-fast -p iceberg-storage-opendal --all-features --test file_io_hdfs_test -- --ignored || test_status=$?
+    fi
     exit "${test_status}"
     ;;
   cargo-machete)
