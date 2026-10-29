@@ -165,7 +165,57 @@ pub(crate) struct HmsCatalogConfig {
     props: HashMap<String, String>,
 }
 
-struct HmsClient(ThriftHiveMetastoreClient);
+struct HmsClient(Arc<ThriftHiveMetastoreClient>);
+
+struct TableLockGuard {
+    client: Arc<ThriftHiveMetastoreClient>,
+    lock_id: Option<i64>,
+}
+
+impl TableLockGuard {
+    async fn release(&mut self) -> Result<()> {
+        let Some(lock_id) = self.lock_id else {
+            return Ok(());
+        };
+
+        self.client
+            .unlock(UnlockRequest { lockid: lock_id })
+            .await
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
+        self.lock_id = None;
+        Ok(())
+    }
+}
+
+impl Drop for TableLockGuard {
+    fn drop(&mut self) {
+        let Some(lock_id) = self.lock_id.take() else {
+            return;
+        };
+        let client = Arc::clone(&self.client);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let result = client
+                .unlock(UnlockRequest { lockid: lock_id })
+                .await
+                .map(from_thrift_exception)
+                .map_err(from_thrift_error);
+            if let Err(error) = result {
+                tracing::warn!(lock_id, error = ?error, "failed to release abandoned Hive Metastore table lock");
+            }
+        });
+    }
+}
+
+async fn release_lock_on_error(mut lock: TableLockGuard, error: Error) -> Error {
+    if let Err(unlock_error) = lock.release().await {
+        tracing::warn!(error = ?unlock_error, "failed to release Hive Metastore table lock after an error");
+    }
+    error
+}
 
 /// Hive metastore Catalog.
 pub struct HmsCatalog {
@@ -224,7 +274,7 @@ impl HmsCatalog {
 
         Ok(Self {
             config,
-            client: HmsClient(client),
+            client: HmsClient(Arc::new(client)),
             file_io,
         })
     }
@@ -252,7 +302,7 @@ impl HmsCatalog {
             .table)
     }
 
-    async fn acquire_table_lock(&self, db_name: &str, table_name: &str) -> Result<i64> {
+    async fn acquire_table_lock(&self, db_name: &str, table_name: &str) -> Result<TableLockGuard> {
         let mut response = self
             .client
             .0
@@ -273,12 +323,16 @@ impl HmsCatalog {
             .map_err(from_thrift_error)??;
 
         let lock_id = response.lockid;
+        let lock = TableLockGuard {
+            client: Arc::clone(&self.client.0),
+            lock_id: Some(lock_id),
+        };
         for _ in 0..600 {
             match response.state {
-                state if state == LockState::ACQUIRED => return Ok(lock_id),
+                state if state == LockState::ACQUIRED => return Ok(lock),
                 state if state == LockState::WAITING => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
-                    response = self
+                    let next_response = self
                         .client
                         .0
                         .check_lock(hive_metastore::CheckLockRequest {
@@ -287,37 +341,36 @@ impl HmsCatalog {
                         })
                         .await
                         .map(from_thrift_exception)
-                        .map_err(from_thrift_error)??;
+                        .map_err(from_thrift_error);
+                    response = match next_response {
+                        Ok(Ok(response)) => response,
+                        Ok(Err(error)) | Err(error) => {
+                            return Err(release_lock_on_error(lock, error).await);
+                        }
+                    };
                 }
                 state if state == LockState::NOT_ACQUIRED || state == LockState::ABORT => {
-                    return Err(Error::new(
+                    let error = Error::new(
                         ErrorKind::CatalogCommitConflicts,
                         format!("Hive Metastore returned lock state {state:?}"),
-                    ));
+                    );
+                    return Err(release_lock_on_error(lock, error).await);
                 }
                 state => {
-                    return Err(Error::new(
+                    let error = Error::new(
                         ErrorKind::CatalogCommitConflicts,
                         format!("Hive Metastore returned lock state {state:?}"),
-                    ));
+                    );
+                    return Err(release_lock_on_error(lock, error).await);
                 }
             }
         }
 
-        Err(Error::new(
+        let error = Error::new(
             ErrorKind::CatalogCommitConflicts,
             "Timed out waiting for the Hive Metastore table lock",
-        ))
-    }
-
-    async fn release_table_lock(&self, lock_id: i64) -> Result<()> {
-        self.client
-            .0
-            .unlock(UnlockRequest { lockid: lock_id })
-            .await
-            .map(from_thrift_exception)
-            .map_err(from_thrift_error)??;
-        Ok(())
+        );
+        Err(release_lock_on_error(lock, error).await)
     }
 
     async fn update_table_locked(
@@ -793,14 +846,14 @@ impl Catalog for HmsCatalog {
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
         let table_ident = commit.identifier().clone();
         let db_name = validate_namespace(table_ident.namespace())?;
-        let lock_id = self
+        let mut lock = self
             .acquire_table_lock(&db_name, table_ident.name())
             .await?;
 
         let result = self
             .update_table_locked(commit, &db_name, &table_ident)
             .await;
-        let unlock_result = self.release_table_lock(lock_id).await;
+        let unlock_result = lock.release().await;
 
         return match (result, unlock_result) {
             (Err(error), _) => Err(error),

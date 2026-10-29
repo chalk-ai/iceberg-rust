@@ -236,7 +236,9 @@ pub(crate) fn update_hive_table(
     )?;
 
     table.sd = updated.sd;
-    table.parameters = updated.parameters;
+    let mut parameters = table.parameters.unwrap_or_default();
+    parameters.extend(updated.parameters.unwrap_or_default());
+    table.parameters = Some(parameters);
     Ok(table)
 }
 
@@ -440,6 +442,10 @@ mod tests {
         )?;
         existing.partition_keys = Some(vec![]);
         existing.owner = Some("existing-owner".into());
+        existing.parameters.as_mut().unwrap().insert(
+            "storage_handler".into(),
+            "com.example.ExistingStorageHandler".into(),
+        );
 
         let updated = update_hive_table(
             existing,
@@ -458,6 +464,14 @@ mod tests {
                 .and_then(|params| params.get(METADATA_LOCATION))
                 .map(ToString::to_string),
             Some("hdfs://warehouse/my_table/metadata/v2.metadata.json".to_string())
+        );
+        assert_eq!(
+            updated
+                .parameters
+                .as_ref()
+                .and_then(|params| params.get("storage_handler"))
+                .map(ToString::to_string),
+            Some("com.example.ExistingStorageHandler".to_string())
         );
         Ok(())
     }
