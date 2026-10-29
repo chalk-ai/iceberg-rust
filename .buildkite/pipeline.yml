@@ -28,8 +28,6 @@ steps:
 
       - label: ":docker: integration tests"
         command: "bash .buildkite/ci.sh docker-integration-test"
-        soft_fail:
-          - exit_status: "*"
 
   - group: "Repository hygiene"
     steps:

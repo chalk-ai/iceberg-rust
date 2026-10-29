@@ -19,12 +19,15 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
 use hive_metastore::{
+    GetTableRequest, LockComponent, LockLevel, LockRequest, LockState, LockType,
     ThriftHiveMetastoreClient, ThriftHiveMetastoreClientBuilder,
-    ThriftHiveMetastoreGetDatabaseException, ThriftHiveMetastoreGetTableException,
+    ThriftHiveMetastoreGetDatabaseException, ThriftHiveMetastoreGetTableReqException,
+    UnlockRequest,
 };
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
@@ -162,7 +165,57 @@ pub(crate) struct HmsCatalogConfig {
     props: HashMap<String, String>,
 }
 
-struct HmsClient(ThriftHiveMetastoreClient);
+struct HmsClient(Arc<ThriftHiveMetastoreClient>);
+
+struct TableLockGuard {
+    client: Arc<ThriftHiveMetastoreClient>,
+    lock_id: Option<i64>,
+}
+
+impl TableLockGuard {
+    async fn release(&mut self) -> Result<()> {
+        let Some(lock_id) = self.lock_id else {
+            return Ok(());
+        };
+
+        self.client
+            .unlock(UnlockRequest { lockid: lock_id })
+            .await
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
+        self.lock_id = None;
+        Ok(())
+    }
+}
+
+impl Drop for TableLockGuard {
+    fn drop(&mut self) {
+        let Some(lock_id) = self.lock_id.take() else {
+            return;
+        };
+        let client = Arc::clone(&self.client);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let result = client
+                .unlock(UnlockRequest { lockid: lock_id })
+                .await
+                .map(from_thrift_exception)
+                .map_err(from_thrift_error);
+            if let Err(error) = result {
+                tracing::warn!(lock_id, error = ?error, "failed to release abandoned Hive Metastore table lock");
+            }
+        });
+    }
+}
+
+async fn release_lock_on_error(mut lock: TableLockGuard, error: Error) -> Error {
+    if let Err(unlock_error) = lock.release().await {
+        tracing::warn!(error = ?unlock_error, "failed to release Hive Metastore table lock after an error");
+    }
+    error
+}
 
 /// Hive metastore Catalog.
 pub struct HmsCatalog {
@@ -221,13 +274,148 @@ impl HmsCatalog {
 
         Ok(Self {
             config,
-            client: HmsClient(client),
+            client: HmsClient(Arc::new(client)),
             file_io,
         })
     }
     /// Get the catalogs `FileIO`
     pub fn file_io(&self) -> FileIO {
         self.file_io.clone()
+    }
+
+    async fn load_hive_table(
+        &self,
+        db_name: &str,
+        table_name: &str,
+    ) -> Result<hive_metastore::Table> {
+        Ok(self
+            .client
+            .0
+            .get_table_req(GetTableRequest {
+                db_name: db_name.to_string().into(),
+                tbl_name: table_name.to_string().into(),
+                ..Default::default()
+            })
+            .await
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??
+            .table)
+    }
+
+    async fn acquire_table_lock(&self, db_name: &str, table_name: &str) -> Result<TableLockGuard> {
+        let mut response = self
+            .client
+            .0
+            .lock(LockRequest {
+                component: vec![LockComponent {
+                    r#type: LockType::EXCLUSIVE,
+                    level: LockLevel::TABLE,
+                    dbname: db_name.to_string().into(),
+                    tablename: Some(table_name.to_string().into()),
+                    ..Default::default()
+                }],
+                user: "iceberg-rust".into(),
+                hostname: "iceberg-rust".into(),
+                ..Default::default()
+            })
+            .await
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
+
+        let lock_id = response.lockid;
+        let lock = TableLockGuard {
+            client: Arc::clone(&self.client.0),
+            lock_id: Some(lock_id),
+        };
+        for _ in 0..600 {
+            match response.state {
+                state if state == LockState::ACQUIRED => return Ok(lock),
+                state if state == LockState::WAITING => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let next_response = self
+                        .client
+                        .0
+                        .check_lock(hive_metastore::CheckLockRequest {
+                            lockid: lock_id,
+                            ..Default::default()
+                        })
+                        .await
+                        .map(from_thrift_exception)
+                        .map_err(from_thrift_error);
+                    response = match next_response {
+                        Ok(Ok(response)) => response,
+                        Ok(Err(error)) | Err(error) => {
+                            return Err(release_lock_on_error(lock, error).await);
+                        }
+                    };
+                }
+                state if state == LockState::NOT_ACQUIRED || state == LockState::ABORT => {
+                    let error = Error::new(
+                        ErrorKind::CatalogCommitConflicts,
+                        format!("Hive Metastore returned lock state {state:?}"),
+                    );
+                    return Err(release_lock_on_error(lock, error).await);
+                }
+                state => {
+                    let error = Error::new(
+                        ErrorKind::CatalogCommitConflicts,
+                        format!("Hive Metastore returned lock state {state:?}"),
+                    );
+                    return Err(release_lock_on_error(lock, error).await);
+                }
+            }
+        }
+
+        let error = Error::new(
+            ErrorKind::CatalogCommitConflicts,
+            "Timed out waiting for the Hive Metastore table lock",
+        );
+        Err(release_lock_on_error(lock, error).await)
+    }
+
+    async fn update_table_locked(
+        &self,
+        commit: TableCommit,
+        db_name: &str,
+        table_ident: &TableIdent,
+    ) -> Result<Table> {
+        let hive_table = self.load_hive_table(db_name, table_ident.name()).await?;
+        let metadata_location = get_metadata_location(&hive_table.parameters)?;
+        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
+        let current_table = Table::builder()
+            .file_io(self.file_io())
+            .metadata_location(metadata_location)
+            .metadata(metadata)
+            .identifier(table_ident.clone())
+            .build()?;
+
+        let staged_table = commit.apply(current_table)?;
+        let staged_metadata_location = staged_table.metadata_location_result()?.to_string();
+        staged_table
+            .metadata()
+            .write_to(staged_table.file_io(), &staged_metadata_location)
+            .await?;
+
+        let updated_hive_table = update_hive_table(
+            hive_table,
+            staged_table.metadata().current_schema(),
+            staged_table.metadata().location().to_string(),
+            staged_metadata_location,
+            staged_table.metadata().properties(),
+        )?;
+
+        self.client
+            .0
+            .alter_table(
+                db_name.to_string().into(),
+                table_ident.name().to_string().into(),
+                updated_hive_table,
+            )
+            .await
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
+
+        Ok(staged_table)
     }
 }
 
@@ -285,7 +473,8 @@ impl Catalog for HmsCatalog {
             .0
             .create_database(database)
             .await
-            .map_err(from_thrift_error)?;
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
 
         Ok(Namespace::with_properties(namespace.clone(), properties))
     }
@@ -378,7 +567,8 @@ impl Catalog for HmsCatalog {
             .0
             .alter_database(name.clone(), db)
             .await
-            .map_err(from_thrift_error)?;
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
 
         Ok(())
     }
@@ -397,7 +587,8 @@ impl Catalog for HmsCatalog {
             .0
             .drop_database(name.into(), false, false)
             .await
-            .map_err(from_thrift_error)?;
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
 
         Ok(())
     }
@@ -481,7 +672,8 @@ impl Catalog for HmsCatalog {
             .0
             .create_table(hive_table)
             .await
-            .map_err(from_thrift_error)?;
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
 
         Table::builder()
             .file_io(self.file_io())
@@ -506,13 +698,7 @@ impl Catalog for HmsCatalog {
     async fn load_table(&self, table: &TableIdent) -> Result<Table> {
         let db_name = validate_namespace(table.namespace())?;
 
-        let hive_table = self
-            .client
-            .0
-            .get_table(db_name.clone().into(), table.name.clone().into())
-            .await
-            .map(from_thrift_exception)
-            .map_err(from_thrift_error)??;
+        let hive_table = self.load_hive_table(&db_name, table.name()).await?;
 
         let metadata_location = get_metadata_location(&hive_table.parameters)?;
 
@@ -546,7 +732,8 @@ impl Catalog for HmsCatalog {
             .0
             .drop_table(db_name.into(), table.name.clone().into(), false)
             .await
-            .map_err(from_thrift_error)?;
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
 
         Ok(())
     }
@@ -565,12 +752,18 @@ impl Catalog for HmsCatalog {
         let resp = self
             .client
             .0
-            .get_table(db_name.into(), table_name.into())
+            .get_table_req(GetTableRequest {
+                db_name: db_name.into(),
+                tbl_name: table_name.into(),
+                ..Default::default()
+            })
             .await;
 
         match resp {
             Ok(MaybeException::Ok(_)) => Ok(true),
-            Ok(MaybeException::Exception(ThriftHiveMetastoreGetTableException::O2(_))) => Ok(false),
+            Ok(MaybeException::Exception(ThriftHiveMetastoreGetTableReqException::O2(_))) => {
+                Ok(false)
+            }
             Ok(MaybeException::Exception(exception)) => Err(Error::new(
                 ErrorKind::Unexpected,
                 "Operation failed for hitting thrift error".to_string(),
@@ -596,10 +789,15 @@ impl Catalog for HmsCatalog {
         let mut tbl = self
             .client
             .0
-            .get_table(src_dbname.clone().into(), src_tbl_name.clone().into())
+            .get_table_req(GetTableRequest {
+                db_name: src_dbname.clone().into(),
+                tbl_name: src_tbl_name.clone().into(),
+                ..Default::default()
+            })
             .await
             .map(from_thrift_exception)
-            .map_err(from_thrift_error)??;
+            .map_err(from_thrift_error)??
+            .table;
 
         tbl.db_name = Some(dest_dbname.into());
         tbl.table_name = Some(dest_tbl_name.into());
@@ -608,26 +806,59 @@ impl Catalog for HmsCatalog {
             .0
             .alter_table(src_dbname.into(), src_tbl_name.into(), tbl)
             .await
-            .map_err(from_thrift_error)?;
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
 
         Ok(())
     }
 
     async fn register_table(
         &self,
-        _table_ident: &TableIdent,
-        _metadata_location: String,
+        table_ident: &TableIdent,
+        metadata_location: String,
     ) -> Result<Table> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Registering a table is not supported yet",
-        ))
+        let db_name = validate_namespace(table_ident.namespace())?;
+        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
+        let hive_table = convert_to_hive_table(
+            db_name,
+            metadata.current_schema(),
+            table_ident.name().to_string(),
+            metadata.location().to_string(),
+            metadata_location.clone(),
+            metadata.properties(),
+        )?;
+
+        self.client
+            .0
+            .create_table(hive_table)
+            .await
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
+
+        Table::builder()
+            .file_io(self.file_io())
+            .metadata_location(metadata_location)
+            .metadata(metadata)
+            .identifier(table_ident.clone())
+            .build()
     }
 
-    async fn update_table(&self, _commit: TableCommit) -> Result<Table> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Updating a table is not supported yet",
-        ))
+    async fn update_table(&self, commit: TableCommit) -> Result<Table> {
+        let table_ident = commit.identifier().clone();
+        let db_name = validate_namespace(table_ident.namespace())?;
+        let mut lock = self
+            .acquire_table_lock(&db_name, table_ident.name())
+            .await?;
+
+        let result = self
+            .update_table_locked(commit, &db_name, &table_ident)
+            .await;
+        let unlock_result = lock.release().await;
+
+        return match (result, unlock_result) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(table), Ok(())) => Ok(table),
+        };
     }
 }

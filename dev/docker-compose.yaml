@@ -48,7 +48,7 @@ services:
       - "9001:9001"
     command: ["server", "/data", "--console-address", ":9001"]
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "wget", "--spider", "--quiet", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -133,6 +133,77 @@ services:
       retries: 20
       start_period: 30s
 
+  # Hive 3.1.3 compatibility target. Keep this service separate so the HMS
+  # catalog test suite can run against both supported server generations.
+  hive-metastore-3:
+    build:
+      context: ./hms
+      dockerfile: Dockerfile-3.1.3
+    platform: ${DOCKER_DEFAULT_PLATFORM:-linux/amd64}
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      iceberg_test:
+    ports:
+      - "9084:9083"
+    environment:
+      SERVICE_NAME: "metastore"
+      SERVICE_OPTS: "-Dmetastore.warehouse.dir=s3a://warehouse/hive/"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "cat < /dev/null > /dev/tcp/localhost/9083"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # =============================================================================
+  # HDFS - single-node NameNode + DataNode for native HDFS tests
+  # =============================================================================
+  # The native client connects to DataNodes using their advertised address,
+  # which is not routable through a bridge network. Host networking keeps the
+  # fixture usable on Linux; the integration tests remain ignored elsewhere.
+  hdfs-namenode:
+    profiles: ["hdfs"]
+    build:
+      context: ./hdfs
+      dockerfile: Dockerfile
+    image: dev-hdfs-namenode:3.5.0
+    network_mode: "host"
+    hostname: localhost
+    command: ["hdfs", "namenode"]
+    environment:
+      ENSURE_NAMENODE_DIR: "/tmp/hadoop-root/dfs/name"
+    extra_hosts:
+      - "docker-desktop:127.0.0.1"
+    healthcheck:
+      test: ["CMD-SHELL", "hdfs dfsadmin -safemode get | grep -q OFF"]
+      interval: 5s
+      timeout: 15s
+      retries: 30
+      start_period: 30s
+
+  hdfs-datanode:
+    profiles: ["hdfs"]
+    build:
+      context: ./hdfs
+      dockerfile: Dockerfile
+    image: dev-hdfs-datanode:3.5.0
+    network_mode: "host"
+    hostname: localhost
+    command: ["hdfs", "datanode"]
+    depends_on:
+      hdfs-namenode:
+        condition: service_healthy
+    extra_hosts:
+      - "docker-desktop:127.0.0.1"
+    healthcheck:
+      test: ["CMD-SHELL", "hdfs dfsadmin -report | grep -q 'Live datanodes (1)'"]
+      interval: 5s
+      timeout: 15s
+      retries: 30
+      start_period: 10s
+
   # =============================================================================
   # Moto - AWS Glue Mock for Glue Catalog tests
   # =============================================================================
@@ -192,22 +263,19 @@ services:
 
   # Provision service - creates test data via Spark
   provision:
-    image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+    build:
+      context: ./spark
+      dockerfile: provision.Dockerfile
+    image: dev-spark-provision:4.0.1
     networks:
       iceberg_test:
     depends_on:
       spark-iceberg:
         condition: service_healthy
-    entrypoint: ["/bin/sh", "-c", "uv run /opt/spark/provision.py && touch /tmp/provision_complete && tail -f /dev/null"]
-    volumes:
-      - ./spark/provision.py:/opt/spark/provision.py:ro
-      - uv-cache:/root/.cache/uv
+    entrypoint: ["/bin/sh", "-c", "python3 /opt/spark/provision.py && touch /tmp/provision_complete && tail -f /dev/null"]
     healthcheck:
       test: ["CMD-SHELL", "[ -f /tmp/provision_complete ]"]
       interval: 2s
       timeout: 2s
       retries: 90
       start_period: 20s
-
-volumes:
-  uv-cache:

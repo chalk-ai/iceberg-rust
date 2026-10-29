@@ -64,6 +64,14 @@ cfg_if! {
 }
 
 cfg_if! {
+    if #[cfg(feature = "opendal-hdfs-native")] {
+        mod hdfs;
+        use hdfs::*;
+        use opendal::services::HdfsNativeConfig;
+    }
+}
+
+cfg_if! {
     if #[cfg(feature = "opendal-memory")] {
         mod memory;
         use memory::*;
@@ -111,6 +119,9 @@ pub enum OpenDalStorageFactory {
     /// GCS storage factory.
     #[cfg(feature = "opendal-gcs")]
     Gcs,
+    /// Native HDFS storage factory.
+    #[cfg(feature = "opendal-hdfs-native")]
+    Hdfs,
     /// OSS storage factory.
     #[cfg(feature = "opendal-oss")]
     Oss,
@@ -145,6 +156,11 @@ impl StorageFactory for OpenDalStorageFactory {
             #[cfg(feature = "opendal-gcs")]
             OpenDalStorageFactory::Gcs => Ok(Arc::new(OpenDalStorage::Gcs {
                 config: gcs_config_parse(config.props().clone())?.into(),
+            })),
+            #[cfg(feature = "opendal-hdfs-native")]
+            OpenDalStorageFactory::Hdfs => Ok(Arc::new(OpenDalStorage::Hdfs {
+                config: hdfs_config_parse(config.props().clone())?.into(),
+                operators: Default::default(),
             })),
             #[cfg(feature = "opendal-oss")]
             OpenDalStorageFactory::Oss => Ok(Arc::new(OpenDalStorage::Oss {
@@ -205,6 +221,15 @@ pub enum OpenDalStorage {
     Gcs {
         /// GCS configuration.
         config: Arc<GcsConfig>,
+    },
+    /// Native HDFS storage variant.
+    #[cfg(feature = "opendal-hdfs-native")]
+    Hdfs {
+        /// HDFS client configuration.
+        config: Arc<HdfsNativeConfig>,
+        /// Operators cached by effective NameNode.
+        #[serde(skip)]
+        operators: Arc<std::sync::RwLock<std::collections::HashMap<String, Operator>>>,
     },
     /// OSS storage variant.
     #[cfg(feature = "opendal-oss")]
@@ -317,6 +342,10 @@ impl OpenDalStorage {
                     ));
                 }
             }
+            #[cfg(feature = "opendal-hdfs-native")]
+            OpenDalStorage::Hdfs { config, operators } => {
+                hdfs_create_operator(path, config, operators)?
+            }
             #[cfg(feature = "opendal-oss")]
             OpenDalStorage::Oss { config } => {
                 let op = oss_config_build(config, path)?;
@@ -339,6 +368,7 @@ impl OpenDalStorage {
                 not(feature = "opendal-s3"),
                 not(feature = "opendal-fs"),
                 not(feature = "opendal-gcs"),
+                not(feature = "opendal-hdfs-native"),
                 not(feature = "opendal-oss"),
                 not(feature = "opendal-azdls"),
             ))]

@@ -30,6 +30,12 @@
 //! - [`OssConfig`]: Alibaba Cloud OSS specific configuration
 //! - [`AzdlsConfig`]: Azure Data Lake Storage specific configuration
 
+/// Storage property selecting the HDFS NameNode used for authority-less paths.
+pub const HDFS_NAME_NODE: &str = "hdfs.name-node";
+
+/// Prefix for Hadoop client configuration properties passed to HDFS.
+pub const HDFS_HADOOP_CONF_PREFIX: &str = "hadoop.";
+
 mod azdls;
 mod gcs;
 mod oss;

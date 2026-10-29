@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use iceberg::io::{FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, CatalogBuilder, Namespace, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_hms::{
     HMS_CATALOG_PROP_THRIFT_TRANSPORT, HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE,
@@ -207,6 +208,75 @@ async fn test_load_table() -> Result<()> {
     assert_eq!(result.metadata_location(), expected.metadata_location());
     assert_eq!(result.metadata(), expected.metadata());
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_register_table() -> Result<()> {
+    let catalog = get_catalog().await;
+    let namespace = NamespaceIdent::new(normalize_test_name_with_parts!("test_register_table"));
+    cleanup_namespace(&catalog, &namespace).await;
+    set_test_namespace(&catalog, &namespace).await?;
+
+    let table = catalog
+        .create_table(
+            &namespace,
+            set_table_creation(
+                Some(format!("s3a://warehouse/hive/{namespace}")),
+                "my_table",
+            )?,
+        )
+        .await?;
+    let metadata_location = table.metadata_location().unwrap().to_string();
+    catalog.drop_table(table.identifier()).await?;
+
+    let registered = catalog
+        .register_table(
+            &TableIdent::new(namespace, "my_table".to_string()),
+            metadata_location.clone(),
+        )
+        .await?;
+
+    assert_eq!(
+        registered.metadata_location(),
+        Some(metadata_location.as_str())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_update_table() -> Result<()> {
+    let catalog = get_catalog().await;
+    let namespace = Namespace::new(NamespaceIdent::new(normalize_test_name_with_parts!(
+        "test_update_table"
+    )));
+    cleanup_namespace(&catalog, namespace.name()).await;
+    set_test_namespace(&catalog, namespace.name()).await?;
+
+    let table = catalog
+        .create_table(namespace.name(), set_table_creation(None, "my_table")?)
+        .await?;
+    let original_metadata_location = table.metadata_location().unwrap().to_string();
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_table_properties()
+        .set("test_property".to_string(), "test_value".to_string())
+        .apply(tx)?;
+    let updated = tx.commit(&catalog).await?;
+
+    assert_ne!(
+        updated.metadata_location(),
+        Some(original_metadata_location.as_str())
+    );
+    assert_eq!(
+        updated.metadata().properties().get("test_property"),
+        Some(&"test_value".to_string())
+    );
+
+    let reloaded = catalog.load_table(updated.identifier()).await?;
+    assert_eq!(reloaded.metadata(), updated.metadata());
+    assert_eq!(reloaded.metadata_location(), updated.metadata_location());
     Ok(())
 }
 
