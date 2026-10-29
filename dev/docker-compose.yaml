@@ -170,6 +170,7 @@ services:
       dockerfile: Dockerfile
     image: dev-hdfs-namenode:3.5.0
     network_mode: "host"
+    hostname: localhost
     command: ["hdfs", "namenode"]
     environment:
       ENSURE_NAMENODE_DIR: "/tmp/hadoop-root/dfs/name"
@@ -189,6 +190,7 @@ services:
       dockerfile: Dockerfile
     image: dev-hdfs-datanode:3.5.0
     network_mode: "host"
+    hostname: localhost
     command: ["hdfs", "datanode"]
     depends_on:
       hdfs-namenode:
