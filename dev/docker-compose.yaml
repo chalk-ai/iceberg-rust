@@ -271,8 +271,6 @@ services:
       spark-iceberg:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c", "python3 /opt/spark/provision.py && touch /tmp/provision_complete && tail -f /dev/null"]
-    volumes:
-      - ./spark/provision.py:/opt/spark/provision.py:ro
     healthcheck:
       test: ["CMD-SHELL", "[ -f /tmp/provision_complete ]"]
       interval: 2s
