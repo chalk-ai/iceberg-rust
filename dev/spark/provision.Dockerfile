@@ -8,10 +8,10 @@
 #
 #   http://www.apache.org/licenses/LICENSE-2.0
 
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+FROM apache/spark:4.0.1
 
-RUN uv pip install --system --no-cache "pyspark[connect]==4.0.1"
+ENV PYTHONPATH=/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.9-src.zip
 
 COPY provision.py /opt/spark/provision.py
 
-ENTRYPOINT ["/bin/sh", "-c", "python /opt/spark/provision.py && touch /tmp/provision_complete && tail -f /dev/null"]
+ENTRYPOINT ["/bin/sh", "-c", "python3 /opt/spark/provision.py && touch /tmp/provision_complete && tail -f /dev/null"]

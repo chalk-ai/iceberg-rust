@@ -237,7 +237,7 @@ services:
   spark-iceberg:
     build:
       context: ./spark
-      dockerfile: provision.Dockerfile
+      dockerfile: Dockerfile
     networks:
       iceberg_test:
     depends_on:
@@ -263,14 +263,14 @@ services:
   provision:
     build:
       context: ./spark
-      dockerfile: Dockerfile
+      dockerfile: provision.Dockerfile
     image: dev-spark-provision:4.0.1
     networks:
       iceberg_test:
     depends_on:
       spark-iceberg:
         condition: service_healthy
-    entrypoint: ["/bin/sh", "-c", "python /opt/spark/provision.py && touch /tmp/provision_complete && tail -f /dev/null"]
+    entrypoint: ["/bin/sh", "-c", "python3 /opt/spark/provision.py && touch /tmp/provision_complete && tail -f /dev/null"]
     volumes:
       - ./spark/provision.py:/opt/spark/provision.py:ro
     healthcheck:
@@ -279,5 +279,3 @@ services:
       timeout: 2s
       retries: 90
       start_period: 20s
-
-volumes: {}
