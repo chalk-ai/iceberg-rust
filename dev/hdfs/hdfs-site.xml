@@ -20,4 +20,28 @@
         <name>dfs.datanode.data.dir</name>
         <value>file:///tmp/hadoop-root/dfs/data</value>
     </property>
+    <property>
+        <name>dfs.namenode.rpc-address</name>
+        <value>127.0.0.1:8020</value>
+    </property>
+    <property>
+        <name>dfs.namenode.http-address</name>
+        <value>127.0.0.1:9870</value>
+    </property>
+    <property>
+        <name>dfs.datanode.address</name>
+        <value>127.0.0.1:9866</value>
+    </property>
+    <property>
+        <name>dfs.datanode.http.address</name>
+        <value>127.0.0.1:9864</value>
+    </property>
+    <property>
+        <name>dfs.datanode.hostname</name>
+        <value>localhost</value>
+    </property>
+    <property>
+        <name>dfs.client.use.datanode.hostname</name>
+        <value>true</value>
+    </property>
 </configuration>
