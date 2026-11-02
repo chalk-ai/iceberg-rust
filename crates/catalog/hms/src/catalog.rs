@@ -207,6 +207,7 @@ async fn unlock_table_with_retries(
 struct TableLockGuard {
     client: Arc<ThriftHiveMetastoreClient>,
     lock_id: Option<i64>,
+    table_name: String,
 }
 
 impl TableLockGuard {
@@ -215,7 +216,7 @@ impl TableLockGuard {
             return Ok(());
         };
 
-        unlock_table(&self.client, lock_id).await?;
+        unlock_table_with_retries(Arc::clone(&self.client), lock_id).await?;
         self.lock_id = None;
         Ok(())
     }
@@ -227,9 +228,11 @@ impl Drop for TableLockGuard {
             return;
         };
         let client = Arc::clone(&self.client);
+        let table_name = self.table_name.clone();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             tracing::warn!(
                 lock_id,
+                table = %table_name,
                 "cannot retry Hive Metastore table lock release without a Tokio runtime"
             );
             return;
@@ -239,8 +242,9 @@ impl Drop for TableLockGuard {
             if let Err(error) = result {
                 tracing::warn!(
                     lock_id,
+                    table = %table_name,
                     error = ?error,
-                    "failed to release abandoned Hive Metastore table lock after retries"
+                    "failed to release abandoned Hive Metastore table lock after retries; HMS must expire the lock"
                 );
             }
         });
@@ -366,6 +370,7 @@ impl HmsCatalog {
         let lock = TableLockGuard {
             client: Arc::clone(&self.client.0),
             lock_id: Some(lock_id),
+            table_name: format!("{}.{}", db_name, table_name),
         };
         for _ in 0..600 {
             match response.state {
