@@ -167,6 +167,43 @@ pub(crate) struct HmsCatalogConfig {
 
 struct HmsClient(Arc<ThriftHiveMetastoreClient>);
 
+const TABLE_LOCK_RELEASE_ATTEMPTS: usize = 3;
+
+async fn unlock_table(client: &ThriftHiveMetastoreClient, lock_id: i64) -> Result<()> {
+    client
+        .unlock(UnlockRequest { lockid: lock_id })
+        .await
+        .map(from_thrift_exception)
+        .map_err(from_thrift_error)??;
+    Ok(())
+}
+
+async fn unlock_table_with_retries(
+    client: Arc<ThriftHiveMetastoreClient>,
+    lock_id: i64,
+) -> Result<()> {
+    let mut last_error = None;
+    for attempt in 0..TABLE_LOCK_RELEASE_ATTEMPTS {
+        match unlock_table(&client, lock_id).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt + 1 < TABLE_LOCK_RELEASE_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
+                }
+            }
+        }
+    }
+
+    match last_error {
+        Some(error) => Err(error),
+        None => Err(Error::new(
+            ErrorKind::Unexpected,
+            "Hive Metastore table lock release did not run",
+        )),
+    }
+}
+
 struct TableLockGuard {
     client: Arc<ThriftHiveMetastoreClient>,
     lock_id: Option<i64>,
@@ -178,11 +215,7 @@ impl TableLockGuard {
             return Ok(());
         };
 
-        self.client
-            .unlock(UnlockRequest { lockid: lock_id })
-            .await
-            .map(from_thrift_exception)
-            .map_err(from_thrift_error)??;
+        unlock_table(&self.client, lock_id).await?;
         self.lock_id = None;
         Ok(())
     }
@@ -195,16 +228,20 @@ impl Drop for TableLockGuard {
         };
         let client = Arc::clone(&self.client);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                lock_id,
+                "cannot retry Hive Metastore table lock release without a Tokio runtime"
+            );
             return;
         };
         handle.spawn(async move {
-            let result = client
-                .unlock(UnlockRequest { lockid: lock_id })
-                .await
-                .map(from_thrift_exception)
-                .map_err(from_thrift_error);
+            let result = unlock_table_with_retries(client, lock_id).await;
             if let Err(error) = result {
-                tracing::warn!(lock_id, error = ?error, "failed to release abandoned Hive Metastore table lock");
+                tracing::warn!(
+                    lock_id,
+                    error = ?error,
+                    "failed to release abandoned Hive Metastore table lock after retries"
+                );
             }
         });
     }
@@ -303,6 +340,9 @@ impl HmsCatalog {
     }
 
     async fn acquire_table_lock(&self, db_name: &str, table_name: &str) -> Result<TableLockGuard> {
+        // HMS alter_table is unconditional, so this server-side lock serializes the
+        // reload/validate/alter sequence across clients. REST and Glue use their
+        // own atomic commit requirements and do not need this catalog-specific lock.
         let mut response = self
             .client
             .0
@@ -853,12 +893,9 @@ impl Catalog for HmsCatalog {
         let result = self
             .update_table_locked(commit, &db_name, &table_ident)
             .await;
-        let unlock_result = lock.release().await;
-
-        return match (result, unlock_result) {
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Ok(table), Ok(())) => Ok(table),
-        };
+        if let Err(error) = lock.release().await {
+            tracing::warn!(error = ?error, "failed to release Hive Metastore table lock after updating a table");
+        }
+        result
     }
 }
