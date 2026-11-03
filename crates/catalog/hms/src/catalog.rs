@@ -19,12 +19,13 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
 use hive_metastore::{
-    GetTableRequest, LockComponent, LockLevel, LockRequest, LockState, LockType,
+    GetTableRequest, HeartbeatRequest, LockComponent, LockLevel, LockRequest, LockState, LockType,
     ThriftHiveMetastoreClient, ThriftHiveMetastoreClientBuilder,
     ThriftHiveMetastoreGetDatabaseException, ThriftHiveMetastoreGetTableReqException,
     UnlockRequest,
@@ -168,6 +169,7 @@ pub(crate) struct HmsCatalogConfig {
 struct HmsClient(Arc<ThriftHiveMetastoreClient>);
 
 const TABLE_LOCK_RELEASE_ATTEMPTS: usize = 3;
+const TABLE_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 async fn unlock_table(client: &ThriftHiveMetastoreClient, lock_id: i64) -> Result<()> {
     client
@@ -208,14 +210,103 @@ struct TableLockGuard {
     client: Arc<ThriftHiveMetastoreClient>,
     lock_id: Option<i64>,
     table_name: String,
+    heartbeat_task: Option<tokio::task::JoinHandle<()>>,
+    ownership_lost: Arc<AtomicBool>,
 }
 
 impl TableLockGuard {
+    fn new(client: Arc<ThriftHiveMetastoreClient>, lock_id: i64, table_name: String) -> Self {
+        let ownership_lost = Arc::new(AtomicBool::new(false));
+        Self {
+            client,
+            lock_id: Some(lock_id),
+            table_name,
+            heartbeat_task: None,
+            ownership_lost,
+        }
+    }
+
+    fn start_heartbeat(&mut self) {
+        let lock_id = self.lock_id.expect("lock guard must have an id");
+        let heartbeat_client = Arc::clone(&self.client);
+        let heartbeat_ownership = Arc::clone(&self.ownership_lost);
+        let heartbeat_table = self.table_name.clone();
+        let heartbeat_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(TABLE_LOCK_HEARTBEAT_INTERVAL);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let result = heartbeat_client
+                    .heartbeat(HeartbeatRequest {
+                        lockid: Some(lock_id),
+                        txnid: None,
+                    })
+                    .await
+                    .map(from_thrift_exception)
+                    .map_err(from_thrift_error)
+                    .and_then(|result| result);
+                if let Err(error) = result {
+                    heartbeat_ownership.store(true, Ordering::Release);
+                    tracing::warn!(
+                        lock_id,
+                        table = %heartbeat_table,
+                        error = ?error,
+                        "lost Hive Metastore table lock heartbeat"
+                    );
+                    return;
+                }
+            }
+        });
+        self.heartbeat_task = Some(heartbeat_task);
+    }
+
+    fn stop_heartbeat(&mut self) {
+        if let Some(task) = self.heartbeat_task.take() {
+            task.abort();
+        }
+    }
+
+    async fn ensure_held(&self) -> Result<()> {
+        let lock_id = self.lock_id.ok_or_else(|| {
+            Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                "Hive Metastore table lock is no longer held",
+            )
+        })?;
+        if self.ownership_lost.load(Ordering::Acquire) {
+            return Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                "Lost the Hive Metastore table lock heartbeat",
+            ));
+        }
+
+        let response = self
+            .client
+            .check_lock(hive_metastore::CheckLockRequest {
+                lockid: lock_id,
+                ..Default::default()
+            })
+            .await
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
+        if response.state != LockState::ACQUIRED {
+            return Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                format!(
+                    "Hive Metastore table lock is no longer acquired: {:?}",
+                    response.state
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     async fn release(&mut self) -> Result<()> {
         let Some(lock_id) = self.lock_id else {
             return Ok(());
         };
 
+        self.stop_heartbeat();
         unlock_table_with_retries(Arc::clone(&self.client), lock_id).await?;
         self.lock_id = None;
         Ok(())
@@ -224,6 +315,7 @@ impl TableLockGuard {
 
 impl Drop for TableLockGuard {
     fn drop(&mut self) {
+        self.stop_heartbeat();
         let Some(lock_id) = self.lock_id.take() else {
             return;
         };
@@ -367,14 +459,18 @@ impl HmsCatalog {
             .map_err(from_thrift_error)??;
 
         let lock_id = response.lockid;
-        let lock = TableLockGuard {
-            client: Arc::clone(&self.client.0),
-            lock_id: Some(lock_id),
-            table_name: format!("{}.{}", db_name, table_name),
-        };
+        let lock = TableLockGuard::new(
+            Arc::clone(&self.client.0),
+            lock_id,
+            format!("{}.{}", db_name, table_name),
+        );
         for _ in 0..600 {
             match response.state {
-                state if state == LockState::ACQUIRED => return Ok(lock),
+                state if state == LockState::ACQUIRED => {
+                    let mut lock = lock;
+                    lock.start_heartbeat();
+                    return Ok(lock);
+                }
                 state if state == LockState::WAITING => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     let next_response = self
@@ -423,6 +519,7 @@ impl HmsCatalog {
         commit: TableCommit,
         db_name: &str,
         table_ident: &TableIdent,
+        lock: &TableLockGuard,
     ) -> Result<Table> {
         let hive_table = self.load_hive_table(db_name, table_ident.name()).await?;
         let metadata_location = get_metadata_location(&hive_table.parameters)?;
@@ -448,6 +545,10 @@ impl HmsCatalog {
             staged_metadata_location,
             staged_table.metadata().properties(),
         )?;
+
+        // alter_table unconditionally replaces HMS's metadata pointer. Verify that
+        // this writer still owns the lock immediately before publishing it.
+        lock.ensure_held().await?;
 
         self.client
             .0
@@ -896,7 +997,7 @@ impl Catalog for HmsCatalog {
             .await?;
 
         let result = self
-            .update_table_locked(commit, &db_name, &table_ident)
+            .update_table_locked(commit, &db_name, &table_ident, &lock)
             .await;
         if let Err(error) = lock.release().await {
             tracing::warn!(error = ?error, "failed to release Hive Metastore table lock after updating a table");
