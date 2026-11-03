@@ -77,9 +77,20 @@ case "${task}" in
     make docker-up
     cargo test --no-fail-fast -p iceberg-integration-tests --all-features || test_status=$?
     cargo test --no-fail-fast -p iceberg-catalog-glue --test glue_catalog_test || test_status=$?
-    cargo test --no-fail-fast -p iceberg-catalog-hms --test hms_catalog_test || test_status=$?
+    for hms_endpoint in localhost:9083 localhost:9084; do
+      ICEBERG_TEST_HMS_ENDPOINT="${hms_endpoint}" \
+        cargo test --no-fail-fast -p iceberg-catalog-hms --test hms_catalog_test || test_status=$?
+    done
     cargo test --no-fail-fast -p iceberg-catalog-rest --test rest_catalog_test || test_status=$?
     cargo test --no-fail-fast -p iceberg-storage-opendal --all-features --test file_io_gcs_test --test file_io_s3_test || test_status=$?
+    if [[ "$(uname -s)" == "Linux" ]]; then
+      if ! docker compose -f dev/docker-compose.yaml --profile hdfs up -d --build --wait hdfs-namenode hdfs-datanode; then
+        docker compose -f dev/docker-compose.yaml --profile hdfs logs --no-color hdfs-namenode hdfs-datanode || true
+        test_status=1
+      else
+        cargo test --no-fail-fast -p iceberg-storage-opendal --all-features --test file_io_hdfs_test -- --ignored || test_status=$?
+      fi
+    fi
     exit "${test_status}"
     ;;
   cargo-machete)

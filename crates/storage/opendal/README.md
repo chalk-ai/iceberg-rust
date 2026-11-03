@@ -31,10 +31,11 @@ OpenDAL-based storage backend implementations for [Apache Iceberg Rust](https://
 | Google Cloud Storage | `opendal-gcs`    | ✅ Stable       | Google Cloud Storage                          |
 | Alibaba Cloud OSS    | `opendal-oss`    | 🧪 Experimental | Alibaba Cloud Object Storage Service          |
 | Azure Datalake       | `opendal-azdls`  | 🧪 Experimental | Azure Datalake Storage v2                     |
+| HDFS / ViewFS        | `opendal-hdfs-native` | 🧪 Experimental | Native Rust HDFS client, no JNI              |
 
 You can enable all stable storage backends at once using the `opendal-all` feature flag.
 
-> Note that `opendal-oss` and `opendal-azdls` are currently experimental and not included in `opendal-all`.
+> Note that `opendal-oss`, `opendal-azdls`, and `opendal-hdfs-native` are currently experimental and not included in the default feature set.
 
 ## Usage
 

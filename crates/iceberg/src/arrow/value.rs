@@ -652,6 +652,9 @@ pub(crate) fn create_primitive_array_single_element(
         (DataType::Int64, Some(PrimitiveLiteral::Long(v))) => {
             Ok(Arc::new(Int64Array::from(vec![*v])))
         }
+        (DataType::Int64, Some(PrimitiveLiteral::Int(v))) => {
+            Ok(Arc::new(Int64Array::from(vec![*v as i64])))
+        }
         (DataType::Int64, None) => Ok(Arc::new(Int64Array::from(vec![Option::<i64>::None]))),
         (DataType::Timestamp(TimeUnit::Microsecond, timezone), Some(PrimitiveLiteral::Long(v))) => {
             let array = TimestampMicrosecondArray::from(vec![*v]);
@@ -880,6 +883,9 @@ pub(crate) fn create_primitive_array_repeated(
         }
         (DataType::Int64, Some(PrimitiveLiteral::Long(value))) => {
             Arc::new(Int64Array::from(vec![*value; num_rows]))
+        }
+        (DataType::Int64, Some(PrimitiveLiteral::Int(value))) => {
+            Arc::new(Int64Array::from(vec![*value as i64; num_rows]))
         }
         (DataType::Int64, None) => {
             let vals: Vec<Option<i64>> = vec![None; num_rows];
@@ -1849,6 +1855,30 @@ mod test {
             }
             other => panic!("Expected Decimal128, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_create_int64_array_from_int_literal() {
+        let target_type = DataType::Int64;
+        let value = PrimitiveLiteral::Int(19);
+
+        let single = create_primitive_array_single_element(&target_type, &Some(value.clone()))
+            .expect("Failed to create single-element Int64 array");
+        assert_eq!(single.data_type(), &target_type);
+        assert_eq!(
+            single
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            19
+        );
+
+        let repeated = create_primitive_array_repeated(&target_type, &Some(value), 2)
+            .expect("Failed to create repeated Int64 array");
+        assert_eq!(repeated.data_type(), &target_type);
+        let repeated = repeated.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(repeated.values().as_ref(), &[19, 19]);
     }
 
     #[test]

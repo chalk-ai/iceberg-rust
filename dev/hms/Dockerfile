@@ -13,17 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM apache/hive:3.1.3
-
-ENV AWSSDK_VERSION=2.20.18
-ENV HADOOP_VERSION=3.1.0
+FROM apache/hive:4.2.1
 
 USER root
 
-ADD https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.1.0/hadoop-aws-3.1.0.jar /opt/hive/lib/hadoop-aws-3.1.0.jar
-ADD https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.11.271/aws-java-sdk-bundle-1.11.271.jar /opt/hive/lib/aws-java-sdk-bundle-1.11.271.jar
-RUN chmod 0644 /opt/hive/lib/hadoop-aws-${HADOOP_VERSION}.jar /opt/hive/lib/aws-java-sdk-bundle-1.11.271.jar
+# Link the Hadoop AWS and AWS SDK jars shipped in the Hive image.
+RUN ln -s /opt/hadoop/share/hadoop/tools/lib/hadoop-aws-*.jar /opt/hive/lib/ && \
+    ln -s /opt/hadoop/share/hadoop/tools/lib/bundle-*.jar /opt/hive/lib/
 
-COPY core-site.xml /opt/hadoop/etc/hadoop/core-site.xml
+ENV HIVE_CUSTOM_CONF_DIR=/opt/hive/custom-conf
+COPY core-site.xml ${HIVE_CUSTOM_CONF_DIR}/core-site.xml
 
 USER hive

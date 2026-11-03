@@ -1,0 +1,19 @@
+name: Auto approve labels
+
+on:
+  pull_request:
+    types: [labeled]
+
+jobs:
+  auto-approve:
+    if: >-
+      github.event.label.name == 'skip-approval' &&
+      (github.event.sender.login == 'abondrnco' || github.event.sender.login == 'reillymcbride')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: hmarr/auto-approve-action@v4
+        with:
+          review-message: "Approved by skip-approval label"

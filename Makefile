@@ -79,7 +79,7 @@ docker-up:
 	docker compose -f dev/docker-compose.yaml up -d --build --wait
 
 docker-down:
-	docker compose -f dev/docker-compose.yaml down -v --remove-orphans --timeout 0
+	docker compose -f dev/docker-compose.yaml --profile hdfs down -v --remove-orphans --timeout 0
 
 docker-logs:
 	docker compose -f dev/docker-compose.yaml logs -f
