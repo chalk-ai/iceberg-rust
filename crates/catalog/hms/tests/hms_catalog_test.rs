@@ -281,6 +281,54 @@ async fn test_update_table() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_timestamp_schema_survives_catalog_updates() -> Result<()> {
+    let catalog = get_catalog().await;
+    let namespace = NamespaceIdent::new(normalize_test_name_with_parts!(
+        "test_timestamp_schema_survives_catalog_updates"
+    ));
+    cleanup_namespace(&catalog, &namespace).await;
+    set_test_namespace(&catalog, &namespace).await?;
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::optional(
+                1,
+                "observed_at",
+                Type::Primitive(PrimitiveType::Timestamptz),
+            )
+            .into(),
+            NestedField::optional(2, "local_time", Type::Primitive(PrimitiveType::Timestamp))
+                .into(),
+        ])
+        .build()?;
+    let table = catalog
+        .create_table(
+            &namespace,
+            TableCreation::builder()
+                .name("timestamps".to_string())
+                .schema(schema.clone())
+                .build(),
+        )
+        .await?;
+    assert_eq!(table.metadata().current_schema().as_ref(), &schema);
+
+    let transaction = Transaction::new(&table);
+    let transaction = transaction
+        .update_table_properties()
+        .set("timestamp_test".to_string(), "committed".to_string())
+        .apply(transaction)?;
+    let updated = transaction.commit(&catalog).await?;
+    let reloaded = catalog.load_table(table.identifier()).await?;
+    assert_eq!(reloaded.metadata().current_schema().as_ref(), &schema);
+    assert_eq!(reloaded.metadata_location(), updated.metadata_location());
+    assert_eq!(
+        reloaded.metadata().properties().get("timestamp_test"),
+        Some(&"committed".to_string())
+    );
+    cleanup_namespace(&catalog, &namespace).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_create_table() -> Result<()> {
     let catalog = get_catalog().await;
     // inject custom location, ignore the namespace prefix
@@ -328,10 +376,10 @@ async fn test_list_tables() -> Result<()> {
     catalog.create_table(ns.name(), creation).await?;
     let result = catalog.list_tables(ns.name()).await?;
 
-    assert_eq!(result, vec![TableIdent::new(
-        ns.name().clone(),
-        "my_table".to_string()
-    )]);
+    assert_eq!(
+        result,
+        vec![TableIdent::new(ns.name().clone(), "my_table".to_string())]
+    );
 
     Ok(())
 }

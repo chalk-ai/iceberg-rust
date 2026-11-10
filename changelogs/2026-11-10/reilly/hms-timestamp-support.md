@@ -1,0 +1,1 @@
+- Allow Hive 3+ HMS catalogs to register and update Iceberg timestamptz columns while preserving timezone-less timestamp columns.
