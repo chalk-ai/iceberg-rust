@@ -502,21 +502,19 @@ mod tests {
 
         let schema = serde_json::from_str::<Schema>(record)?;
         let result = HiveSchemaBuilder::from_iceberg(&schema)?.build();
-        assert_eq!(
-            result,
-            vec![
-                FieldSchema {
-                    name: Some("created_at".into()),
-                    r#type: Some("timestamp with local time zone".into()),
-                    comment: None,
-                },
-                FieldSchema {
-                    name: Some("local_time".into()),
-                    r#type: Some("timestamp".into()),
-                    comment: None,
-                },
-            ]
-        );
+        let expected = vec![
+            FieldSchema {
+                name: Some("created_at".into()),
+                r#type: Some("timestamp with local time zone".into()),
+                comment: None,
+            },
+            FieldSchema {
+                name: Some("local_time".into()),
+                r#type: Some("timestamp".into()),
+                comment: None,
+            },
+        ];
+        assert_eq!(result, expected);
 
         Ok(())
     }
