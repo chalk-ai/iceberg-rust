@@ -19,6 +19,7 @@ use std::fmt::Debug;
 use std::io;
 
 use anyhow::anyhow;
+use hive_metastore::ThriftHiveMetastoreCreateTableException;
 use iceberg::{Error, ErrorKind};
 use volo_thrift::MaybeException;
 
@@ -42,6 +43,19 @@ pub fn from_thrift_exception<T, E: Debug>(value: MaybeException<T, E>) -> Result
             "Operation failed for hitting thrift error".to_string(),
         )
         .with_source(anyhow!("thrift error: {err:?}"))),
+    }
+}
+
+/// Preserve existence conflicts so callers can recover from concurrent table creation.
+pub fn from_create_table_exception(
+    value: MaybeException<(), ThriftHiveMetastoreCreateTableException>,
+) -> Result<(), Error> {
+    match value {
+        MaybeException::Exception(ThriftHiveMetastoreCreateTableException::O1(err)) => Err(
+            Error::new(ErrorKind::TableAlreadyExists, "Table already exists")
+                .with_source(anyhow!("thrift error: {err:?}")),
+        ),
+        other => from_thrift_exception(other),
     }
 }
 
