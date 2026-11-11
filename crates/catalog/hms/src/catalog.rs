@@ -40,7 +40,9 @@ use iceberg::{
 use volo_thrift::MaybeException;
 
 use super::utils::*;
-use crate::error::{from_io_error, from_thrift_error, from_thrift_exception};
+use crate::error::{
+    from_create_table_exception, from_io_error, from_thrift_error, from_thrift_exception,
+};
 
 /// HMS catalog address
 pub const HMS_CATALOG_PROP_URI: &str = "uri";
@@ -818,7 +820,7 @@ impl Catalog for HmsCatalog {
             .0
             .create_table(hive_table)
             .await
-            .map(from_thrift_exception)
+            .map(from_create_table_exception)
             .map_err(from_thrift_error)??;
 
         Table::builder()
@@ -978,7 +980,7 @@ impl Catalog for HmsCatalog {
             .0
             .create_table(hive_table)
             .await
-            .map(from_thrift_exception)
+            .map(from_create_table_exception)
             .map_err(from_thrift_error)??;
 
         Table::builder()

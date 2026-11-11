@@ -16,8 +16,8 @@
 // under the License.
 
 use hive_metastore::FieldSchema;
+use iceberg::Result;
 use iceberg::spec::{PrimitiveType, Schema, SchemaVisitor, visit_schema};
-use iceberg::{Error, ErrorKind, Result};
 
 type HiveSchema = Vec<FieldSchema>;
 
@@ -123,12 +123,8 @@ impl SchemaVisitor for HiveSchemaBuilder {
             PrimitiveType::Timestamp => "timestamp".to_string(),
             PrimitiveType::TimestampNs => "timestamp_ns".to_string(),
             PrimitiveType::TimestamptzNs => "timestamptz_ns".to_string(),
-            PrimitiveType::Timestamptz => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    "Conversion from 'Timestamptz' is not supported",
-                ));
-            }
+            // Hive 3+ represents instants with this type; the Iceberg schema keeps timestamptz.
+            PrimitiveType::Timestamptz => "timestamp with local time zone".to_string(),
             PrimitiveType::Time | PrimitiveType::String | PrimitiveType::Uuid => {
                 "string".to_string()
             }
@@ -494,17 +490,31 @@ mod tests {
                     "name": "created_at",
                     "required": true,
                     "type": "timestamptz"
+                },
+                {
+                    "id": 2,
+                    "name": "local_time",
+                    "required": false,
+                    "type": "timestamp"
                 }
             ]
         }"#;
 
         let schema = serde_json::from_str::<Schema>(record)?;
-        let err = HiveSchemaBuilder::from_iceberg(&schema).unwrap_err();
-
-        assert_eq!(
-            err.to_string(),
-            "FeatureUnsupported => Conversion from 'Timestamptz' is not supported"
-        );
+        let result = HiveSchemaBuilder::from_iceberg(&schema)?.build();
+        let expected = vec![
+            FieldSchema {
+                name: Some("created_at".into()),
+                r#type: Some("timestamp with local time zone".into()),
+                comment: None,
+            },
+            FieldSchema {
+                name: Some("local_time".into()),
+                r#type: Some("timestamp".into()),
+                comment: None,
+            },
+        ];
+        assert_eq!(result, expected);
 
         Ok(())
     }

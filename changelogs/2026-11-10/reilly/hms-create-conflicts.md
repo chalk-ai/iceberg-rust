@@ -1,0 +1,1 @@
+- Preserve typed HMS table-creation and registration conflicts so concurrent writers can load the existing table without replacing its catalog entry.
