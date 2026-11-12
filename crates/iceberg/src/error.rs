@@ -63,6 +63,9 @@ pub enum ErrorKind {
 
     /// Catalog commit failed due to outdated metadata
     CatalogCommitConflicts,
+
+    /// Publication may have succeeded. Do not retry the commit or delete its files.
+    CommitStateUnknown,
 }
 
 impl ErrorKind {
@@ -84,6 +87,7 @@ impl From<ErrorKind> for &'static str {
             ErrorKind::NamespaceNotFound => "NamespaceNotFound",
             ErrorKind::PreconditionFailed => "PreconditionFailed",
             ErrorKind::CatalogCommitConflicts => "CatalogCommitConflicts",
+            ErrorKind::CommitStateUnknown => "CommitStateUnknown",
         }
     }
 }
@@ -327,7 +331,7 @@ impl Error {
 
     /// Return error's retryable status
     pub fn retryable(&self) -> bool {
-        self.retryable
+        self.retryable && self.kind != ErrorKind::CommitStateUnknown
     }
 
     /// Return error's message.

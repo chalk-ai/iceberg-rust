@@ -1095,6 +1095,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_commit_unknown_is_never_retried() {
+        let table = setup_test_table("3");
+        let tx = create_test_transaction(&table);
+        let mut catalog = MockCatalog::new();
+        let refreshed = table.clone();
+        catalog.expect_load_table().times(1).returning(move |_| {
+            let refreshed = refreshed.clone();
+            Box::pin(async move { Ok(refreshed) })
+        });
+        catalog.expect_update_table().times(1).returning(|_| {
+            Box::pin(async {
+                Err(
+                    Error::new(ErrorKind::CommitStateUnknown, "publication is ambiguous")
+                        .with_retryable(true),
+                )
+            })
+        });
+        let error = tx.commit(&catalog).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
+        assert!(!error.retryable());
+    }
+
+    #[tokio::test]
     async fn test_commit_non_retryable_error() {
         // Create a test table with retry properties
         let table = setup_test_table("3");

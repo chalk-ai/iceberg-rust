@@ -31,7 +31,7 @@ use hive_metastore::{
     UnlockRequest,
 };
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
-use iceberg::spec::{TableMetadata, TableMetadataBuilder};
+use iceberg::spec::{MetadataLog, TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
@@ -544,7 +544,7 @@ impl HmsCatalog {
             hive_table,
             staged_table.metadata().current_schema(),
             staged_table.metadata().location().to_string(),
-            staged_metadata_location,
+            staged_metadata_location.clone(),
             staged_table.metadata().properties(),
         )?;
 
@@ -552,19 +552,96 @@ impl HmsCatalog {
         // this writer still owns the lock immediately before publishing it.
         lock.ensure_held().await?;
 
-        self.client
-            .0
-            .alter_table(
-                db_name.to_string().into(),
-                table_ident.name().to_string().into(),
-                updated_hive_table,
-            )
-            .await
-            .map(from_thrift_exception)
-            .map_err(from_thrift_error)??;
+        publish_and_reconcile(
+            &staged_metadata_location,
+            async {
+                // HMS exceptions can be raised by listeners after the pointer changes;
+                // neither a declared exception nor a transport failure proves rejection.
+                self.client
+                    .0
+                    .alter_table(
+                        db_name.to_string().into(),
+                        table_ident.name().to_string().into(),
+                        updated_hive_table,
+                    )
+                    .await
+                    .map(from_thrift_exception)
+                    .map_err(from_thrift_error)??;
+                Ok(())
+            },
+            || async {
+                let hive_table = self.load_hive_table(db_name, table_ident.name()).await?;
+                let location = get_metadata_location(&hive_table.parameters)?;
+                if location == staged_metadata_location {
+                    return Ok(CommitStatus::Confirmed);
+                }
+                let metadata = TableMetadata::read_from(&self.file_io, &location).await?;
+                Ok(commit_status(
+                    &staged_metadata_location,
+                    &location,
+                    metadata.metadata_log(),
+                ))
+            },
+        )
+        .await?;
 
         Ok(staged_table)
     }
+}
+
+/// Absence from a bounded metadata history cannot establish that a commit failed.
+#[derive(Clone, Copy)]
+enum CommitStatus {
+    Confirmed,
+    Unconfirmed,
+}
+
+fn commit_status(attempted: &str, current: &str, history: &[MetadataLog]) -> CommitStatus {
+    if current == attempted || history.iter().any(|entry| entry.metadata_file == attempted) {
+        CommitStatus::Confirmed
+    } else {
+        CommitStatus::Unconfirmed
+    }
+}
+
+/// Reconcile only errors from publication; staging and lock errors remain definitive.
+async fn publish_and_reconcile<P, R, F>(
+    metadata_location: &str,
+    publish: P,
+    mut reload: R,
+) -> Result<()>
+where
+    P: Future<Output = Result<()>>,
+    R: FnMut() -> F,
+    F: Future<Output = Result<CommitStatus>>,
+{
+    let publish_error = match publish.await {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    // Bound status checks to three reads with exponential backoff.
+    // A later commit can move the pointer, so confirmation includes metadata history.
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
+        }
+        match reload().await {
+            Ok(CommitStatus::Confirmed) => return Ok(()),
+            Ok(CommitStatus::Unconfirmed) => {}
+            Err(error) => tracing::warn!(error = ?error, "failed to check HMS commit status"),
+        }
+    }
+
+    // Never clean up or replay an unconfirmed publication: the original RPC may
+    // still complete, or a subsequent commit may have pruned the evidence.
+    Err(Error::new(
+        ErrorKind::CommitStateUnknown,
+        format!(
+            "Cannot determine commit state for metadata {metadata_location}; preserve its files"
+        ),
+    )
+    .with_source(publish_error))
 }
 
 #[async_trait]
@@ -1005,5 +1082,100 @@ impl Catalog for HmsCatalog {
             tracing::warn!(error = ?error, "failed to release Hive Metastore table lock after updating a table");
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod commit_reconciliation_tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    fn ambiguous_error() -> Error {
+        Error::new(ErrorKind::Unexpected, "lost publish response")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publish_success_does_not_reload() -> Result<()> {
+        let calls = Cell::new(0);
+        publish_and_reconcile("attempted", async { Ok(()) }, || {
+            calls.set(calls.get() + 1);
+            async { Err(ambiguous_error()) }
+        })
+        .await?;
+        assert_eq!(calls.get(), 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn confirms_current_or_historical_metadata() -> Result<()> {
+        for current in ["attempted", "later"] {
+            let history = vec![MetadataLog {
+                metadata_file: "attempted".to_string(),
+                timestamp_ms: 1,
+            }];
+            let calls = Cell::new(0);
+            publish_and_reconcile("attempted", async { Err(ambiguous_error()) }, || {
+                calls.set(calls.get() + 1);
+                let status = commit_status(
+                    "attempted",
+                    current,
+                    if current == "later" { &history } else { &[] },
+                );
+                async move { Ok(status) }
+            })
+            .await?;
+            assert_eq!(calls.get(), 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn absent_or_unreadable_metadata_remains_unknown() {
+        for read_fails in [false, true] {
+            let calls = Cell::new(0);
+            let start = tokio::time::Instant::now();
+            let result =
+                publish_and_reconcile("attempted", async { Err(ambiguous_error()) }, || {
+                    calls.set(calls.get() + 1);
+                    async move {
+                        if read_fails {
+                            Err(ambiguous_error())
+                        } else {
+                            Ok(commit_status("attempted", "other", &[]))
+                        }
+                    }
+                })
+                .await;
+            assert_eq!(calls.get(), 3);
+            assert_eq!(start.elapsed(), Duration::from_secs(3));
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
+            assert!(error.message().contains("attempted"));
+            assert!(format!("{error:?}").contains("lost publish response"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_confirmation_succeeds() -> Result<()> {
+        for read_fails in [false, true] {
+            let calls = Cell::new(0);
+            publish_and_reconcile("attempted", async { Err(ambiguous_error()) }, || {
+                calls.set(calls.get() + 1);
+                let attempt = calls.get();
+                async move {
+                    if attempt > 1 {
+                        Ok(CommitStatus::Confirmed)
+                    } else if read_fails {
+                        Err(ambiguous_error())
+                    } else {
+                        Ok(CommitStatus::Unconfirmed)
+                    }
+                }
+            })
+            .await?;
+            assert_eq!(calls.get(), 2);
+        }
+        Ok(())
     }
 }
