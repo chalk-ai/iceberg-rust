@@ -1,0 +1,1 @@
+- Fix ambiguous HMS commits by checking current and historical metadata locations and preserving an explicit, non-retryable unknown outcome when publication cannot be confirmed.
