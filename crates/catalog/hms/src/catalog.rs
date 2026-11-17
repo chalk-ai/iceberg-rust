@@ -58,10 +58,10 @@ pub const THRIFT_TRANSPORT_BUFFERED: &str = "buffered";
 pub const HMS_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
 
 /// Builder for [`HmsCatalog`].
-#[derive(Debug)]
 pub struct HmsCatalogBuilder {
     config: HmsCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
+    thrift_client: Option<ThriftHiveMetastoreClient>,
 }
 
 impl Default for HmsCatalogBuilder {
@@ -75,7 +75,31 @@ impl Default for HmsCatalogBuilder {
                 props: HashMap::new(),
             },
             storage_factory: None,
+            thrift_client: None,
         }
+    }
+}
+
+impl Debug for HmsCatalogBuilder {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HmsCatalogBuilder")
+            .field("config", &self.config)
+            .field("storage_factory", &self.storage_factory)
+            .field("custom_thrift_client", &self.thrift_client.is_some())
+            .finish()
+    }
+}
+
+impl HmsCatalogBuilder {
+    /// Supplies the Thrift client used for every catalog operation.
+    ///
+    /// This allows callers to configure authenticated transports such as SASL/GSSAPI
+    /// without coupling the catalog to a particular credential provider. The caller
+    /// owns endpoint resolution and transport configuration for this client; `uri`
+    /// remains required as part of the catalog configuration.
+    pub fn with_thrift_client(mut self, client: ThriftHiveMetastoreClient) -> Self {
+        self.thrift_client = Some(client);
+        self
     }
 }
 
@@ -139,7 +163,7 @@ impl CatalogBuilder for HmsCatalogBuilder {
                     "Catalog warehouse is required",
                 ))
             } else {
-                HmsCatalog::new(self.config, self.storage_factory)
+                HmsCatalog::new(self.config, self.storage_factory, self.thrift_client)
             }
         };
 
@@ -372,29 +396,34 @@ impl HmsCatalog {
     fn new(
         config: HmsCatalogConfig,
         storage_factory: Option<Arc<dyn StorageFactory>>,
+        thrift_client: Option<ThriftHiveMetastoreClient>,
     ) -> Result<Self> {
-        let address = config
-            .address
-            .as_str()
-            .to_socket_addrs()
-            .map_err(from_io_error)?
-            .next()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("invalid address: {}", config.address),
-                )
-            })?;
+        let client = if let Some(client) = thrift_client {
+            client
+        } else {
+            let address = config
+                .address
+                .as_str()
+                .to_socket_addrs()
+                .map_err(from_io_error)?
+                .next()
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("invalid address: {}", config.address),
+                    )
+                })?;
 
-        let builder = ThriftHiveMetastoreClientBuilder::new("hms").address(address);
+            let builder = ThriftHiveMetastoreClientBuilder::new("hms").address(address);
 
-        let client = match &config.thrift_transport {
-            HmsThriftTransport::Framed => builder
-                .make_codec(volo_thrift::codec::default::DefaultMakeCodec::framed())
-                .build(),
-            HmsThriftTransport::Buffered => builder
-                .make_codec(volo_thrift::codec::default::DefaultMakeCodec::buffered())
-                .build(),
+            match &config.thrift_transport {
+                HmsThriftTransport::Framed => builder
+                    .make_codec(volo_thrift::codec::default::DefaultMakeCodec::framed())
+                    .build(),
+                HmsThriftTransport::Buffered => builder
+                    .make_codec(volo_thrift::codec::default::DefaultMakeCodec::buffered())
+                    .build(),
+            }
         };
 
         let factory = storage_factory.ok_or_else(|| {
@@ -1005,5 +1034,75 @@ impl Catalog for HmsCatalog {
             tracing::warn!(error = ?error, "failed to release Hive Metastore table lock after updating a table");
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod custom_client_tests {
+    use std::io;
+    use std::sync::atomic::AtomicUsize;
+
+    use volo::net::Address;
+    use volo::net::conn::{OwnedReadHalf, OwnedWriteHalf};
+    use volo::net::dial::MakeTransport;
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct RefusingTransport(Arc<AtomicUsize>);
+
+    impl MakeTransport for RefusingTransport {
+        type ReadHalf = OwnedReadHalf;
+        type WriteHalf = OwnedWriteHalf;
+
+        async fn make_transport(
+            &self,
+            _address: Address,
+        ) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "test authentication failure",
+            ))
+        }
+
+        fn set_connect_timeout(&mut self, _: Option<Duration>) {}
+        fn set_read_timeout(&mut self, _: Option<Duration>) {}
+        fn set_write_timeout(&mut self, _: Option<Duration>) {}
+    }
+
+    #[tokio::test]
+    async fn catalog_uses_injected_transport_and_propagates_authentication_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let client = ThriftHiveMetastoreClientBuilder::new("custom-hms")
+            .address("127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap())
+            .make_transport(RefusingTransport(attempts.clone()))
+            .make_codec(volo_thrift::codec::default::DefaultMakeCodec::buffered())
+            .build();
+        let catalog = HmsCatalogBuilder::default()
+            .with_thrift_client(client)
+            .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
+            .load(
+                "custom",
+                HashMap::from([
+                    (
+                        HMS_CATALOG_PROP_URI.into(),
+                        "resolved-by-custom-client".into(),
+                    ),
+                    (HMS_CATALOG_PROP_WAREHOUSE.into(), "/tmp/warehouse".into()),
+                ]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        let error = catalog
+            .namespace_exists(&NamespaceIdent::new("default".into()))
+            .await
+            .unwrap_err();
+        assert!(attempts.load(Ordering::SeqCst) > 0);
+        assert!(
+            error.to_string().contains("test authentication failure"),
+            "{error}"
+        );
     }
 }
