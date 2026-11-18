@@ -306,11 +306,20 @@ pub(crate) fn get_metadata_location(
 fn format_location_uri(location: String) -> String {
     let mut location = location;
 
-    if !location.starts_with('/') {
+    // A URI scheme already qualifies the location; a leading slash would turn it into a path.
+    let has_scheme = location.split_once(':').is_some_and(|(scheme, _)| {
+        let mut chars = scheme.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    if !location.starts_with('/') && !has_scheme {
         location = format!("/{location}");
     }
 
-    if location.ends_with('/') && location.len() > 1 {
+    if location.ends_with('/')
+        && location.len() > 1
+        && !location.trim_end_matches('/').ends_with(':')
+    {
         location.pop();
     }
 
@@ -553,6 +562,7 @@ mod tests {
 
         assert_eq!(db.name, Some(FastStr::from("my_namespace")));
         assert_eq!(db.description, Some(FastStr::from("my_description")));
+        assert_eq!(db.location_uri, Some(FastStr::from("/my_location")));
         assert_eq!(db.owner_name, Some(FastStr::from("apache")));
         assert_eq!(db.owner_type, Some(PrincipalType::USER));
 
@@ -574,6 +584,29 @@ mod tests {
         assert_eq!(db.owner_name, Some(FastStr::from(HMS_DEFAULT_DB_OWNER)));
         assert_eq!(db.owner_type, Some(PrincipalType::USER));
 
+        Ok(())
+    }
+
+    #[test]
+    fn namespace_location_uri_survives_hms_conversion() -> Result<()> {
+        let ident = NamespaceIdent::new("test_namespace".into());
+        for location in [
+            "hdfs://namenode:8020/user/hive/warehouse/ns",
+            "hdfs:///user/hive/warehouse/ns",
+            "viewfs://mount-table/warehouse/ns",
+            "s3://bucket/warehouse/ns",
+            "file:///tmp/warehouse/ns",
+        ] {
+            let properties = HashMap::from([(LOCATION.to_string(), location.to_string())]);
+            let database = convert_to_database(&ident, &properties)?;
+            assert_eq!(database.location_uri.as_deref(), Some(location));
+            let namespace = convert_to_namespace(&database)?;
+            assert_eq!(namespace.name(), &ident);
+            assert_eq!(
+                namespace.properties().get(LOCATION),
+                Some(&location.to_string())
+            );
+        }
         Ok(())
     }
 
@@ -603,5 +636,31 @@ mod tests {
             let location = format_location_uri(inp.to_string());
             assert_eq!(location, out);
         })
+    }
+
+    #[test]
+    fn format_location_uri_preserves_schemes_and_authorities() {
+        for (input, expected) in [
+            ("hdfs:///", "hdfs:///"),
+            ("file:///", "file:///"),
+            ("file:/", "file:/"),
+            (
+                "hdfs://namenode:8020/warehouse/ns/",
+                "hdfs://namenode:8020/warehouse/ns",
+            ),
+            ("hdfs:///warehouse/ns/", "hdfs:///warehouse/ns"),
+            (
+                "viewfs://mount-table/warehouse/",
+                "viewfs://mount-table/warehouse",
+            ),
+            ("s3://bucket/warehouse/ns/", "s3://bucket/warehouse/ns"),
+            ("file:///tmp/warehouse/ns/", "file:///tmp/warehouse/ns"),
+            ("file:/tmp/warehouse/ns/", "file:/tmp/warehouse/ns"),
+            ("/warehouse/ns/", "/warehouse/ns"),
+            ("warehouse/ns/", "/warehouse/ns"),
+            ("warehouse/part:name/", "/warehouse/part:name"),
+        ] {
+            assert_eq!(format_location_uri(input.to_string()), expected, "{input}");
+        }
     }
 }
