@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
+use iceberg::spec::TableProperties;
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, TableCommit,
@@ -696,11 +697,16 @@ impl Catalog for RestCatalog {
     async fn create_table(
         &self,
         namespace: &NamespaceIdent,
-        creation: TableCreation,
+        mut creation: TableCreation,
     ) -> Result<Table> {
         let context = self.context().await?;
 
         let table_ident = TableIdent::new(namespace.clone(), creation.name.clone());
+        // REST expresses the typed creation version as a reserved table property.
+        creation.properties.insert(
+            TableProperties::PROPERTY_FORMAT_VERSION.to_string(),
+            (creation.format_version as u8).to_string(),
+        );
 
         let request = context
             .client
@@ -2327,6 +2333,58 @@ mod tests {
 
         config_mock.assert_async().await;
         rename_table_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_create_table_preserves_format_version() {
+        for requested in [
+            None,
+            Some(FormatVersion::V1),
+            Some(FormatVersion::V2),
+            Some(FormatVersion::V3),
+        ] {
+            let mut server = Server::new_async().await;
+            let config_mock = create_config_mock(&mut server).await;
+            let expected = (requested.unwrap_or(FormatVersion::V2) as u8).to_string();
+            let create_mock = server
+                .mock("POST", "/v1/namespaces/ns1/tables")
+                .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                    "name": "test1",
+                    "properties": {
+                        "format-version": expected,
+                        "owner": "testx"
+                    }
+                })))
+                .with_status(200)
+                .with_body_from_file(format!(
+                    "{}/testdata/create_table_response.json",
+                    env!("CARGO_MANIFEST_DIR")
+                ))
+                .create_async()
+                .await;
+            let catalog = RestCatalog::new(
+                RestCatalogConfig::builder().uri(server.url()).build(),
+                Some(Arc::new(LocalFsStorageFactory)),
+            );
+            let builder = TableCreation::builder()
+                .name("test1".to_string())
+                .schema(Schema::builder().build().unwrap())
+                // The typed field is authoritative even if properties conflict.
+                .properties(HashMap::from([
+                    ("owner".to_string(), "testx".to_string()),
+                    ("format-version".to_string(), "99".to_string()),
+                ]));
+            let creation = match requested {
+                Some(version) => builder.format_version(version).build(),
+                None => builder.build(),
+            };
+            catalog
+                .create_table(&NamespaceIdent::new("ns1".to_string()), creation)
+                .await
+                .unwrap();
+            config_mock.assert_async().await;
+            create_mock.assert_async().await;
+        }
     }
 
     #[tokio::test]
