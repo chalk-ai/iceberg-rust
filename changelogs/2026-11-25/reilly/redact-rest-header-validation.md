@@ -1,0 +1,1 @@
+- Identify REST catalog headers with invalid values without exposing their values in validation errors.

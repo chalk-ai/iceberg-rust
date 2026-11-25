@@ -277,7 +277,7 @@ impl RestCatalogConfig {
                 HeaderValue::from_str(value).map_err(|e| {
                     Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Invalid header value: {value}"),
+                        format!("Invalid value for header: {key}"),
                     )
                     .with_source(e)
                 })?,
@@ -1051,6 +1051,7 @@ impl Catalog for RestCatalog {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
     use std::fs::File;
     use std::io::BufReader;
     use std::sync::Arc;
@@ -1415,6 +1416,46 @@ mod tests {
             ),
         ]);
         assert_eq!(headers, expected_headers);
+    }
+
+    #[test]
+    fn test_http_headers_redact_invalid_values() {
+        let secret = "fake-secret-for-header-validation";
+
+        for key in ["Authorization", "customized-header"] {
+            let value = format!("Bearer {secret}");
+            let mut config = RestCatalogConfig::builder()
+                .uri("http://localhost".to_string())
+                .props(HashMap::from([(format!("header.{key}"), value.clone())]))
+                .build();
+            assert_eq!(config.extra_headers().unwrap()[key], value);
+
+            config
+                .props
+                .insert(format!("header.{key}"), format!("{value}\n"));
+            let error = config.extra_headers().unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::DataInvalid);
+            assert!(
+                error
+                    .source()
+                    .unwrap()
+                    .is::<http::header::InvalidHeaderValue>()
+            );
+
+            let mut current: Option<&dyn std::error::Error> = Some(&error);
+            while let Some(cause) = current {
+                for rendered in [
+                    format!("{cause}"),
+                    format!("{cause:#}"),
+                    format!("{cause:?}"),
+                    format!("{cause:#?}"),
+                ] {
+                    assert!(!rendered.contains(secret));
+                }
+                current = cause.source();
+            }
+            assert_eq!(error.message(), format!("Invalid value for header: {key}"));
+        }
     }
 
     #[tokio::test]
